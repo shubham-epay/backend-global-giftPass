@@ -17,7 +17,7 @@ const ROLES = [
   { name: 'Super Admin', description: 'Full access to everything. System role.', permissions: [SUPER], isSystem: true },
   { name: 'Catalogue Manager', description: 'Products, categories, partners, gift boxes and coupons.', permissions: [
     'dashboard.read', 'products.read', 'products.create', 'products.update', 'products.delete',
-    'categories.manage', 'partners.manage', 'giftBoxes.manage', 'coupons.read', 'coupons.create', 'coupons.update'] },
+    'categories.manage', 'partners.manage', 'giftBoxes.manage', 'countries.manage', 'coupons.read', 'coupons.create', 'coupons.update'] },
   { name: 'Order Manager', description: 'Orders and vouchers.', permissions: [
     'dashboard.read', 'orders.read', 'orders.updateStatus', 'vouchers.read', 'vouchers.create', 'vouchers.update', 'products.read'] },
   { name: 'Content Editor', description: 'Banners, collections, blogs and FAQs.', permissions: ['cms.manage', 'products.read'] },

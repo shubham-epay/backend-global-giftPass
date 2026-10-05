@@ -51,7 +51,7 @@ const partnerCreate = z.object({
 
 const textList = (max, count) => z.array(z.string().trim().min(1).max(max)).max(count).optional();
 const productCreate = z.object({
-  title: str(200), slug, categoryId: objectId, partnerId: objectId, city: str(80), country: str(80),
+  title: str(200), slug, categoryId: objectId, partnerId: objectId, city: optStr(80), country: str(80),
   price: money, salePrice: money, duration: str(60), validityDays: int(1, 3650),
   imageUrls: z.array(url).min(1, 'Add at least one image URL').max(20), status: z.enum(E.PRODUCT_STATUS),
   galleryUrls: urlArray.optional(), featured: z.boolean().optional(), bestSeller: z.boolean().optional(),
@@ -62,6 +62,23 @@ const productCreate = z.object({
   packageDetails: z.array(z.object({ label: str(80), value: z.string().trim().max(300).default('') })).max(30).optional(),
   legalNote: optStr(3000),
   apiDeliveryId: optStr(120), seoTitle: optStr(70), seoDescription: optStr(170),
+  currency: z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/, 'Use a 3-letter currency code such as AED').optional(),
+  countries: objectIdArray.max(250).optional(),
+  amountMin: optMoney, amountMax: optMoney,
+  denominations: z.array(z.object({
+    value: money.refine((x) => x > 0, 'Must be more than 0'),
+    price: money,
+    oldPrice: optMoney,
+    label: optStr(60),
+    img: optUrl,
+    attributes: z.array(z.object({ label: str(80), value: z.string().trim().max(500).default(''), public: z.boolean().default(false) })).max(20).optional(),
+  })).max(200).optional(),
+  customFields: z.array(z.object({
+    key: z.string().trim().max(80).optional(),
+    label: str(80),
+    value: z.string().trim().max(500).default(''),
+    public: z.boolean().default(false),
+  })).max(50).optional(),
 });
 
 const flag = (def) => z.enum(['true', 'false']).default(def).transform((x) => x === 'true');
@@ -73,6 +90,32 @@ const productImportQuery = z.object({
   city: optStr(80), country: optStr(80), duration: optStr(60), fallbackPartner: optStr(160),
   validityDays: z.preprocess((x) => (x === '' ? undefined : x), z.coerce.number().int().min(1).max(3650).optional()),
   status: z.enum(E.PRODUCT_STATUS).default('DRAFT'),
+  // JSON: { "<CSV header>": "public" | "internal" } - extra columns to keep as product custom fields
+  customColumns: z.string().max(8000).optional(),
+});
+
+// Bulk actions on products: either explicit ids, or every product matching the list filters.
+const productBulk = z.object({
+  action: z.enum(['setStatus', 'delete']),
+  status: z.enum(E.PRODUCT_STATUS).optional(),
+  ids: objectIdArray.max(5000).optional(),
+  filter: z.object({
+    q: z.string().trim().max(100).optional(),
+    status: z.enum(E.PRODUCT_STATUS).optional(),
+    categoryId: objectId.optional(), partnerId: objectId.optional(), country: objectId.optional(),
+    featured: z.enum(['true', 'false']).optional(),
+  }).optional(),
+}).superRefine((d, ctx) => {
+  if (!d.ids?.length && !d.filter) ctx.addIssue({ code: 'custom', path: ['ids'], message: 'Select at least one product' });
+  if (d.action === 'setStatus' && !d.status) ctx.addIssue({ code: 'custom', path: ['status'], message: 'Choose a status' });
+});
+
+const countryCreate = z.object({
+  name: str(80),
+  code: z.preprocess((x) => (x === '' || x === null ? undefined : x), z.string().trim().toUpperCase().regex(/^[A-Z]{2}$/, 'Use a 2-letter ISO code such as AE').optional()),
+  currency: z.preprocess((x) => (x === '' || x === null ? undefined : x), z.string().trim().toUpperCase().regex(/^[A-Z]{3}$/, 'Use a 3-letter currency code').optional()),
+  status: z.enum(E.PUBLISH_STATUS).optional(),
+  sortOrder: optInt(-100000, 100000),
 });
 
 const giftBoxCreate = z.object({
@@ -151,9 +194,9 @@ const withUpdate = (schema) => ({ create: schema, update: schema.partial() });
 
 module.exports = {
   login, changePassword, userCreate, userUpdate, resetPassword, roleCreate, roleUpdate,
-  category: withUpdate(categoryCreate), partner: withUpdate(partnerCreate), product: withUpdate(productCreate),
+  category: withUpdate(categoryCreate), country: withUpdate(countryCreate), partner: withUpdate(partnerCreate), product: withUpdate(productCreate),
   giftBox: withUpdate(giftBoxCreate), coupon: withUpdate(couponCreate),
   banner: withUpdate(bannerCreate), collection: withUpdate(collectionCreate),
   blog: withUpdate(blogCreate), faq: withUpdate(faqCreate),
-  productImportQuery, orderStatusUpdate, voucherCreate, voucherUpdate, voucherStatusUpdate,
+  productImportQuery, productBulk, orderStatusUpdate, voucherCreate, voucherUpdate, voucherStatusUpdate,
 };

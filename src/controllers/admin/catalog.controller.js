@@ -1,7 +1,14 @@
-const { Category, Partner, Product, GiftBox, Coupon, OrderItem, CuratedCollection } = require('../../models');
+const {
+  Category, Country, Partner, Product, GiftBox, Coupon, OrderItem, CuratedCollection,
+} = require('../../models');
+const { COUNTRIES, findIsoCountry } = require('../../constants/countries');
+const { escapeRegex } = require('../../utils/helpers');
 const ApiError = require('../../utils/ApiError');
 const { crudController } = require('./crud.factory');
 const { ensureAllExist } = require('../../services/reference.service');
+const asyncHandler = require('../../utils/asyncHandler');
+const { hasPermission } = require('../../middlewares/auth');
+const { audit } = require('../../services/audit.service');
 
 // ---------------- Categories ----------------
 const categories = crudController(Category, {
@@ -61,6 +68,7 @@ const partners = crudController(Partner, {
 const productRefs = async (data) => {
   if (data.categoryId) await ensureAllExist(Category, data.categoryId, 'Category', 'categoryId');
   if (data.partnerId) await ensureAllExist(Partner, data.partnerId, 'Partner', 'partnerId');
+  if (data.countries?.length) await ensureAllExist(Country, data.countries, 'Country', 'countries');
 };
 const products = crudController(Product, {
   resource: 'products', label: 'Product',
@@ -68,9 +76,10 @@ const products = crudController(Product, {
   filters: {
     status: 'string', categoryId: 'objectId', partnerId: 'objectId', city: 'string',
     featured: 'boolean', bestSeller: 'boolean', flashSale: 'boolean',
+    country: { field: 'countries', type: 'objectId' },
   },
   sortable: ['title', 'price', 'salePrice', 'createdAt', 'updatedAt', 'status', 'soldCount'],
-  populate: [{ path: 'categoryId', select: 'name slug' }, { path: 'partnerId', select: 'name city' }],
+  populate: [{ path: 'categoryId', select: 'name slug' }, { path: 'partnerId', select: 'name city' }, { path: 'countries', select: 'name code flag' }],
   hooks: {
     beforeCreate: async (_req, data) => productRefs(data),
     beforeUpdate: async (_req, _doc, data) => productRefs(data),
@@ -125,4 +134,89 @@ const coupons = crudController(Coupon, {
   },
 });
 
-module.exports = { categories, partners, products, giftBoxes, coupons };
+// ---------------- Countries ----------------
+const nameTaken = async (name, exceptId) => Country.exists({
+  name: new RegExp(`^${escapeRegex(name.trim())}$`, 'i'), ...(exceptId && { _id: { $ne: exceptId } }),
+});
+const countries = crudController(Country, {
+  resource: 'countries', label: 'Country',
+  searchFields: ['name', 'code', 'currency'],
+  filters: { status: 'string' },
+  sortable: ['name', 'code', 'sortOrder', 'createdAt', 'status'],
+  defaultSort: 'name',
+  // Product count per country, for the admin list.
+  decorate: async (items) => {
+    if (!items.length) return items;
+    const counts = await Product.aggregate([
+      { $match: { countries: { $in: items.map((c) => c._id) } } },
+      { $unwind: '$countries' },
+      { $group: { _id: '$countries', n: { $sum: 1 }, live: { $sum: { $cond: [{ $eq: ['$status', 'ACTIVE'] }, 1, 0] } } } },
+    ]);
+    const byId = new Map(counts.map((c) => [String(c._id), c]));
+    return items.map((c) => ({ ...c, productCount: byId.get(String(c._id))?.n || 0, liveCount: byId.get(String(c._id))?.live || 0 }));
+  },
+  hooks: {
+    beforeCreate: async (_req, data) => {
+      // "UAE" / "United States of America" become the standard name + ISO code.
+      const iso = findIsoCountry(data.code) || findIsoCountry(data.name);
+      if (iso && !data.code) { data.code = iso.code; data.name = iso.name; }
+      if (await nameTaken(data.name)) throw ApiError.conflict(`${data.name} already exists`, [{ path: 'name', message: 'Already added' }]);
+    },
+    beforeUpdate: async (_req, doc, data) => {
+      if (data.name && await nameTaken(data.name, doc._id)) throw ApiError.conflict(`${data.name} already exists`, [{ path: 'name', message: 'Already added' }]);
+    },
+    beforeDelete: async (_req, doc) => {
+      const n = await Product.countDocuments({ countries: doc._id });
+      if (n) throw ApiError.conflict(`${n} product(s) are sold in ${doc.name}. Hide the country instead, or remove it from those products first.`);
+    },
+  },
+});
+
+// ---------------- Product bulk actions ----------------
+const BULK_LIMIT = 5000;
+/**
+ * POST /admin/products/bulk  { action: 'setStatus' | 'delete', status?, ids? | filter? }
+ * `filter` uses the same fields as the product list, so "select all matching" acts on exactly what the admin sees.
+ * Deleting skips products that are ordered or used in gift boxes / collections and reports why.
+ */
+const productBulk = asyncHandler(async (req, res) => {
+  const { action, status, ids, filter } = req.body;
+  const need = action === 'delete' ? 'products.delete' : 'products.update';
+  if (!hasPermission(req.user.permissions, need)) throw ApiError.forbidden();
+
+  const query = ids?.length ? { _id: { $in: ids } } : products.filterFromQuery(filter || {});
+  const total = await Product.countDocuments(query);
+  if (total === 0) throw ApiError.badRequest('No products match this selection');
+  if (total > BULK_LIMIT) throw ApiError.badRequest(`Select at most ${BULK_LIMIT} products at a time (this selection has ${total})`);
+
+  if (action === 'setStatus') {
+    // Only products whose status actually changes are touched (and counted).
+    const r = await Product.updateMany({ $and: [query, { status: { $ne: status } }] }, { $set: { status, updatedBy: req.user._id } });
+    audit(req, { action: 'products.bulkStatus', resource: 'products', summary: `Set ${r.modifiedCount} product(s) to ${status}`, changes: { status: { from: null, to: status }, count: { from: null, to: r.modifiedCount } } });
+    return res.json({ success: true, data: { action, status, matched: total, updated: r.modifiedCount } });
+  }
+
+  const docs = await Product.find(query).select('_id title').lean();
+  const docIds = docs.map((d) => d._id);
+  const [ordered, boxes, collections] = await Promise.all([
+    OrderItem.distinct('productId', { productId: { $in: docIds } }),
+    GiftBox.distinct('productIds', { productIds: { $in: docIds } }),
+    CuratedCollection.distinct('productIds', { productIds: { $in: docIds } }),
+  ]);
+  const why = new Map();
+  for (const id of collections) why.set(String(id), 'Used in a collection');
+  for (const id of boxes) why.set(String(id), 'Used in a gift box');
+  for (const id of ordered) why.set(String(id), 'Has been ordered — archive it instead');
+  const deletable = docs.filter((d) => !why.has(String(d._id))).map((d) => d._id);
+  const r = deletable.length ? await Product.deleteMany({ _id: { $in: deletable } }) : { deletedCount: 0 };
+  const skipped = docs.filter((d) => why.has(String(d._id))).map((d) => ({ _id: d._id, title: d.title, reason: why.get(String(d._id)) }));
+  audit(req, { action: 'products.bulkDelete', resource: 'products', summary: `Deleted ${r.deletedCount} product(s)${skipped.length ? `, kept ${skipped.length} in use` : ''}` });
+  return res.json({ success: true, data: { action, matched: total, deleted: r.deletedCount, skipped } });
+});
+
+/** ISO reference list for the "add country" picker. */
+const isoCountries = (_req, res) => res.json({ success: true, data: COUNTRIES.map(({ code, name, currency }) => ({ code, name, currency })) });
+
+module.exports = {
+  categories, countries, isoCountries, partners, products, productBulk, giftBoxes, coupons,
+};

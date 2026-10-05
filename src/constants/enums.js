@@ -19,6 +19,13 @@ const PAYMENT_STATUS = ['PENDING', 'AUTHORIZED', 'PAID', 'FAILED', 'REFUNDED', '
 const REVENUE_ORDER_STATUSES = ['PAID', 'PROCESSING', 'SENT', 'DELIVERED'];
 const VOUCHER_ISSUABLE_ORDER_STATUSES = ['PAID', 'PROCESSING', 'SENT', 'DELIVERED'];
 
+// How the customer chose to pay at checkout (the gateway confirms payment via webhook).
+//  CARD           - SynraPay Hosted Checkout (redirect to SynraPay's payment page)
+//  HOSTED_SESSION - SynraPay Hosted Session (card fields embedded in our checkout)
+//  PAY_BY_LINK    - SynraPay payment link (standard or quick), payable now or shared
+//  DIRECT_CARD    - SynraPay Direct API (our own card form; the card passes through our server - PCI DSS scope)
+const PAYMENT_METHODS = ['CARD', 'HOSTED_SESSION', 'PAY_BY_LINK', 'DIRECT_CARD', 'TABBY', 'TAMARA', 'PAYTABS'];
+const PAYMENT_LINK_TYPES = ['STANDARD', 'QUICK'];
 const VOUCHER_STATUS = ['ACTIVE', 'REDEEMED', 'EXPIRED', 'EXCHANGED', 'CANCELLED'];
 const VOUCHER_TRANSITIONS = Object.freeze({
   ACTIVE: ['REDEEMED', 'EXPIRED', 'EXCHANGED', 'CANCELLED'],
@@ -38,6 +45,6 @@ const BANNER_TEXT_THEMES = ['DARK', 'LIGHT'];
 module.exports = {
   PUBLISH_STATUS, PRODUCT_STATUS, USER_TYPES, USER_STATUS, DISCOUNT_TYPES,
   ORDER_STATUS, ORDER_TRANSITIONS, PAYMENT_STATUS, REVENUE_ORDER_STATUSES, VOUCHER_ISSUABLE_ORDER_STATUSES,
-  VOUCHER_STATUS, VOUCHER_TRANSITIONS, BLOG_STATUS, REVIEW_STATUS, ITEM_TYPES,
+  VOUCHER_STATUS, VOUCHER_TRANSITIONS, PAYMENT_METHODS, PAYMENT_LINK_TYPES, BLOG_STATUS, REVIEW_STATUS, ITEM_TYPES,
   BANNER_PLACEMENTS, BANNER_TEXT_POSITIONS, BANNER_TEXT_THEMES,
 };

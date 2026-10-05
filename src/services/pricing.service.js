@@ -2,10 +2,26 @@ const { Product, GiftBox, Coupon, Order, Setting } = require('../models');
 const ApiError = require('../utils/ApiError');
 const { round2 } = require('../utils/helpers');
 
-const PRODUCT_CARD_FIELDS = 'title slug imageUrls price salePrice currency city country duration validityDays categoryId partnerId featured bestSeller flashSale ratingAvg ratingCount shortDescription';
+const PRODUCT_CARD_FIELDS = 'title slug imageUrls price salePrice currency city country duration validityDays categoryId partnerId featured bestSeller flashSale ratingAvg ratingCount shortDescription amountMin amountMax countries denominations.value denominations.price denominations.oldPrice denominations.label denominations.img';
 const GIFT_BOX_CARD_FIELDS = 'name price salePrice currency coverImageUrl validityDays description';
 
 const unitPriceOf = (doc) => (doc.salePrice != null ? doc.salePrice : doc.price);
+const isOpenAmount = (doc) => doc?.amountMin != null && doc?.amountMax != null;
+const hasDenominations = (doc) => Array.isArray(doc?.denominations) && doc.denominations.length > 0;
+/** Products where the customer picks a value: an open amount or one of several denominations. */
+const needsAmount = (doc) => isOpenAmount(doc) || hasDenominations(doc);
+const denominationFor = (doc, amount) => (hasDenominations(doc) ? doc.denominations.find((d) => d.value === amount) : undefined);
+/** Why the chosen amount / denomination is not acceptable, or null when it is. */
+const amountProblem = (doc, amount) => {
+  if (hasDenominations(doc)) {
+    if (amount == null) return `Choose a denomination: ${doc.denominations.map((d) => d.value).join(', ')}`;
+    return denominationFor(doc, amount) ? null : `${amount} is not an available denomination`;
+  }
+  if (!isOpenAmount(doc)) return null;
+  if (amount == null) return `Choose an amount between ${doc.amountMin} and ${doc.amountMax}`;
+  if (amount < doc.amountMin || amount > doc.amountMax) return `The amount must be between ${doc.amountMin} and ${doc.amountMax}`;
+  return null;
+};
 
 /**
  * Re-prices a cart against the live catalogue. Prices are never trusted from the client or the
@@ -24,8 +40,11 @@ async function priceCart(cart) {
   const lines = items.map((item) => {
     const ref = item.itemType === 'PRODUCT' ? item.productId : item.giftBoxId;
     const doc = byId.get(String(ref));
-    const available = Boolean(doc && doc.status === 'ACTIVE');
-    const unitPrice = available ? round2(unitPriceOf(doc)) : 0;
+    // Open-amount products are priced at the amount the customer chose, re-checked against the live range.
+    const problem = doc ? amountProblem(doc, item.amount) : null;
+    const available = Boolean(doc && doc.status === 'ACTIVE' && !problem);
+    const unitPrice = !available ? 0
+      : round2(hasDenominations(doc) ? denominationFor(doc, item.amount).price : isOpenAmount(doc) ? item.amount : unitPriceOf(doc));
     return {
       _id: item._id,
       itemType: item.itemType,
@@ -35,6 +54,9 @@ async function priceCart(cart) {
       recipient: item.recipient,
       message: item.message,
       available,
+      unavailableReason: !doc || doc.status !== 'ACTIVE' ? 'No longer available' : problem || undefined,
+      amount: item.amount,
+      currency: doc?.currency || 'AED',
       unitPrice,
       lineTotal: round2(unitPrice * item.quantity),
       item: doc ? {
@@ -50,12 +72,17 @@ async function priceCart(cart) {
         partner: doc.partnerId ? { _id: doc.partnerId._id, name: doc.partnerId.name } : undefined,
         partnerId: doc.partnerId?._id,
         validityDays: doc.validityDays,
+        amountMin: doc.amountMin,
+        amountMax: doc.amountMax,
       } : null,
     };
   });
 
   const subtotal = round2(lines.filter((l) => l.available).reduce((n, l) => n + l.lineTotal, 0));
-  return { lines, subtotal, itemCount: lines.filter((l) => l.available).reduce((n, l) => n + l.quantity, 0) };
+  // One cart = one currency (there is no FX conversion). 'MIXED' is reported so checkout can refuse it.
+  const currencies = [...new Set(lines.filter((l) => l.available).map((l) => l.currency))];
+  const currency = currencies.length > 1 ? 'MIXED' : currencies[0] || 'AED';
+  return { lines, subtotal, currency, itemCount: lines.filter((l) => l.available).reduce((n, l) => n + l.quantity, 0) };
 }
 
 const couponError = (message) => new ApiError(422, 'COUPON_INVALID', message, [{ path: 'code', message }]);
@@ -64,7 +91,9 @@ const couponError = (message) => new ApiError(422, 'COUPON_INVALID', message, [{
  * Validates a coupon against priced cart lines for a user and returns the discount.
  * Throws a 422 COUPON_INVALID with a customer-friendly reason when it does not apply.
  */
-async function evaluateCoupon(code, { lines, subtotal }, userId) {
+async function evaluateCoupon(code, { lines, subtotal, currency = 'AED' }, userId, email) {
+  // Coupon values and minimum order amounts are defined in AED.
+  if (currency !== 'AED') throw couponError('Coupons can only be used on orders in AED');
   const coupon = await Coupon.findOne({ code: String(code).toUpperCase() }).lean();
   const now = new Date();
   if (!coupon || coupon.status !== 'ACTIVE') throw couponError('This coupon code is not valid');
@@ -74,8 +103,10 @@ async function evaluateCoupon(code, { lines, subtotal }, userId) {
   if (subtotal < (coupon.minimumOrderValue || 0)) {
     throw couponError(`Add items worth at least ${coupon.minimumOrderValue} AED to use this coupon`);
   }
-  if (userId) {
-    const used = await Order.countDocuments({ userId, couponId: coupon._id, orderStatus: { $ne: 'CANCELLED' } });
+  // Per-customer limit: by account when signed in, by email for guest checkouts (either one matches).
+  const owner = [userId && { userId }, email && { 'customer.email': String(email).toLowerCase() }].filter(Boolean);
+  if (owner.length) {
+    const used = await Order.countDocuments({ $or: owner, couponId: coupon._id, orderStatus: { $ne: 'CANCELLED' } });
     if (used >= (coupon.usagePerUser || 1)) throw couponError('You have already used this coupon');
   }
 
@@ -123,4 +154,6 @@ async function totals(subtotal, discount = 0) {
   return { subtotal, discountTotal: round2(discount), taxTotal: round2(total - total / (1 + rate)), total, vatRate: rate, pricesIncludeVat: true };
 }
 
-module.exports = { PRODUCT_CARD_FIELDS, GIFT_BOX_CARD_FIELDS, priceCart, evaluateCoupon, totals };
+module.exports = {
+  PRODUCT_CARD_FIELDS, GIFT_BOX_CARD_FIELDS, priceCart, evaluateCoupon, totals, isOpenAmount, hasDenominations, needsAmount, amountProblem,
+};

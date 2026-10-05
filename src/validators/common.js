@@ -27,7 +27,7 @@ const optDate = emptyToNull(z.union([z.null(), z.coerce.date()])).optional();
 const idParams = z.object({ id: objectId });
 
 const password = z.string()
-  .min(12, 'At least 12 characters')
+  .min(8, 'At least 8 characters')
   .max(128, 'At most 128 characters')
   .regex(/[a-z]/, 'Include a lowercase letter')
   .regex(/[A-Z]/, 'Include an uppercase letter')

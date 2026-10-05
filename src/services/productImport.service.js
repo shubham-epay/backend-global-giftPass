@@ -1,4 +1,7 @@
-const { Product, Category, Partner } = require('../models');
+const {
+  Product, Category, Partner, Country,
+} = require('../models');
+const { findIsoCountry, flagOf } = require('../constants/countries');
 const ApiError = require('../utils/ApiError');
 const { parseCsv, toCsv } = require('../utils/csv');
 const { slugify, isObjectId, round2 } = require('../utils/helpers');
@@ -23,18 +26,21 @@ const MAX_PRODUCTS = 5000; // after denominations are expanded into separate pro
  * is covered by these aliases.
  */
 const FIELDS = [
-  { key: 'title', label: 'Title', required: true, aliases: ['title', 'name', 'productname', 'producttitle', 'experience', 'experiencename'] },
+  { key: 'title', label: 'Title', required: true, aliases: ['title', 'name', 'product', 'productname', 'producttitle', 'experience', 'experiencename'] },
   { key: 'slug', label: 'URL slug', help: 'Generated from the title when empty. Used to match existing products.', aliases: ['slug', 'urlslug', 'handle', 'productslug', 'seourl'] },
   { key: 'category', label: 'Category', required: true, help: 'Category id, slug or name', aliases: ['category', 'categoryid', 'categoryslug', 'categoryname', 'categories', 'productcategory'] },
   { key: 'partner', label: 'Partner', required: true, help: 'Partner id or name (brand is used first, then supplier)', aliases: ['brand', 'brandname', 'partner', 'partnerid', 'partnername', 'merchant', 'merchantname', 'vendor', 'vendorname', 'supplier', 'suppliername'] },
-  { key: 'city', label: 'City', required: true, aliases: ['city', 'cityname', 'location'] },
-  { key: 'country', label: 'Country', required: true, aliases: ['country', 'countryname'] },
+  { key: 'city', label: 'City', help: 'Optional. When a row has a country but no city, no city is set.', aliases: ['city', 'cityname', 'location'] },
+  { key: 'country', label: 'Country', help: 'Name or ISO code (e.g. "United Arab Emirates", "UAE", "AE"); several separated by | or ;. The product is then only shown in those countries. Missing countries are created.', aliases: ['country', 'countryname', 'countries', 'availablein', 'availablecountries', 'countrycode'] },
   { key: 'currency', label: 'Currency', help: '3-letter code, default AED', aliases: ['currency', 'currencycode'] },
   { key: 'price', label: 'Price', required: true, help: 'Selling price. When a list/old price column (delPrice, oldPrice, mrp…) is present that becomes the struck-through price.', aliases: ['price', 'baseprice', 'amount'] },
   { key: 'listPrice', label: 'List (old) price', help: 'Struck-through "was" price', aliases: ['delprice', 'oldprice', 'mrp', 'listprice', 'regularprice', 'originalprice', 'compareatprice', 'wasprice', 'strikeprice'] },
   { key: 'salePrice', label: 'Sale price', help: 'Defaults to price', aliases: ['saleprice', 'sellingprice', 'specialprice', 'discountprice', 'discountedprice', 'finalprice', 'offerprice'] },
   { key: 'duration', label: 'Duration', required: true, help: 'e.g. "90 minutes". Also read from a "Duration" line in packageDetails.', aliases: ['duration', 'durationtext'] },
-  { key: 'validityDays', label: 'Validity (days)', required: true, help: 'Also read from text such as "valid 6 months from purchase"', aliases: ['validitydays', 'validity', 'validityindays', 'expirydays', 'vouchervalidity', 'vouchervaliditydays'] },
+  { key: 'validityDays', label: 'Validity (days)', required: true, help: 'Also read from text such as "valid 6 months from purchase"', aliases: ['validitydays', 'validity', 'validityindays', 'expirydays', 'vouchervalidity', 'vouchervaliditydays', 'expiryinfo', 'expiry', 'validityperiod'] },
+  { key: 'denomination', label: 'Denomination', help: 'Face value(s): "50" (one product), "20, 100" (one product per value) or a range "5-500" (the customer chooses the amount)', aliases: ['denomination', 'denominations', 'facevalue', 'facevalues', 'values', 'amounts', 'denominationvalues'] },
+  { key: 'amountMin', label: 'Minimum amount', help: 'Open-amount products: lowest amount the customer can choose', aliases: ['amountmin', 'minamount', 'minimumamount', 'minvalue'] },
+  { key: 'amountMax', label: 'Maximum amount', help: 'Open-amount products: highest amount the customer can choose', aliases: ['amountmax', 'maxamount', 'maximumamount', 'maxvalue'] },
   { key: 'imageUrls', label: 'Images', required: true, array: true, help: 'One or more image URLs; first is the cover', aliases: ['imageurls', 'imageurl', 'images', 'image', 'imagessrc', 'imagesurl', 'proimg', 'proimgsrc', 'productimages', 'productimagessrc', 'mainimage', 'thumbnail', 'thumbnailurl', 'coverimage', 'photo', 'photos', 'img'] },
   { key: 'galleryUrls', label: 'Gallery', array: true, aliases: ['galleryurls', 'gallery', 'galleryimages', 'additionalimages'] },
   { key: 'status', label: 'Status', help: `${PRODUCT_STATUS.join(' / ')}, or TRUE/FALSE`, aliases: ['status', 'productstatus'] },
@@ -75,6 +81,40 @@ const GROUP_SUBS = {
 const SUB_ALIAS = new Map(Object.entries(GROUP_SUBS).flatMap(([k, as]) => as.map((a) => [a, k])));
 
 const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/**
+ * Unrecognised columns can be kept on the product as custom fields (public = shown to customers,
+ * internal = admin only). These headers are pre-selected; anything else is ignored unless chosen in the import screen.
+ */
+const SUGGESTED_CUSTOM = {
+  productfamily: 'public', family: 'public', deliverytype: 'public', deliverymethod: 'public', redemptiontype: 'public',
+  platform: 'public', region: 'public', format: 'public',
+  producttype: 'internal', margin: 'internal', commission: 'internal', cost: 'internal', costprice: 'internal',
+  supplierprice: 'internal', buyprice: 'internal', sourcesheet: 'internal', suppliercode: 'internal',
+};
+/** "PRODUCT FAMILY" | "deliveryType" | "source_sheet" -> "Product family" / "Delivery type" / "Source sheet" */
+const labelize = (h) => {
+  const words = String(h).trim().replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_\-.[\]]+/g, ' ').replace(/\s+/g, ' ').toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+};
+/** "1 Year" | "6 months" | "90 days" -> days */
+const periodToDays = (s) => {
+  const m = /^\s*(\d{1,4})\s*(day|week|month|year)s?\s*$/i.exec(String(s || ''));
+  if (!m) return undefined;
+  const n = Number(m[1]); const unit = m[2].toLowerCase();
+  const days = unit === 'month' ? Math.round((n * 365) / 12) : { day: 1, week: 7, year: 365 }[unit] * n;
+  return days >= 1 && days <= 3650 ? days : undefined;
+};
+/** "50" -> { values: [50] } · "20, 100" -> { values: [20, 100] } · "5-500" -> { range: [5, 500] } · else null */
+const parseDenomination = (s) => {
+  const t = String(s).trim();
+  const r = /^(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)$/.exec(t);
+  if (r) { const a = Number(r[1]); const b = Number(r[2]); return a <= b ? { range: [a, b] } : null; }
+  const parts = t.split(/[,;|]/).map((x) => x.trim()).filter(Boolean);
+  if (!parts.length || parts.some((x) => !/^\d+(\.\d+)?$/.test(x))) return null;
+  return { values: [...new Set(parts.map(Number))] };
+};
+const fmtAmount = (n) => String(Number(n.toFixed(2)));
 
 /** Header -> { field, index } | { group, index, sub } | null */
 function matchHeader(header) {
@@ -156,9 +196,10 @@ const importSchema = v.product.create.extend({
 
 /** Loads id/slug/name lookups for categories and partners once per import. */
 async function loadRefs() {
-  const [cats, partners] = await Promise.all([
+  const [cats, partners, countries] = await Promise.all([
     Category.find().select('name slug').lean(),
     Partner.find().select('name city').lean(),
+    Country.find().select('name code flag').lean(),
   ]);
   const index = (docs, keys) => {
     const m = new Map();
@@ -168,7 +209,7 @@ async function loadRefs() {
     }
     return m;
   };
-  return { categories: index(cats, ['slug', 'name']), partners: index(partners, ['name']) };
+  return { categories: index(cats, ['slug', 'name']), partners: index(partners, ['name']), countries: index(countries, ['code', 'name']) };
 }
 
 function resolveRef(map, raw, keys) {
@@ -191,6 +232,11 @@ function readCells(cells, mapped) {
     if (!cell) continue;
     // Some exports fill a column with its own name as a placeholder (e.g. supplier = "supplier").
     if (norm(cell) === norm(m.header)) continue;
+    if (m.custom) {
+      raw.__custom = raw.__custom || [];
+      raw.__custom.push({ key: slugify(m.header).slice(0, 80) || `field-${m.col}`, label: labelize(m.header).slice(0, 80), value: cell.slice(0, 500), public: m.custom === 'public' });
+      continue;
+    }
     if (m.group) {
       denominations[m.index] = denominations[m.index] || {};
       denominations[m.index][m.sub] = cell;
@@ -224,7 +270,7 @@ function readCells(cells, mapped) {
  * options: { mode: 'create'|'upsert', createMissing, defaults: { categoryId, partnerId, fallbackPartner, city, country, duration, validityDays, status } }
  */
 async function planImport(csvText, options) {
-  const { mode, createMissing, defaults } = options;
+  const { mode, createMissing, defaults, customColumns } = options;
   const table = parseCsv(csvText);
   if (table.length < 2) throw ApiError.badRequest('The file needs a header row and at least one product row');
   const [headers, ...body] = table;
@@ -233,17 +279,27 @@ async function planImport(csvText, options) {
   // ---- column mapping ----
   const mapped = [];
   const ignored = [];
+  const suggested = {};
+  const custom = [];
   headers.forEach((header, col) => {
     if (!String(header).trim()) return;
     const m = matchHeader(header);
-    if (!m) ignored.push(header);
+    if (!m) {
+      if (SUGGESTED_CUSTOM[norm(header)]) suggested[header] = SUGGESTED_CUSTOM[norm(header)];
+      // No explicit choice sent: apply the suggestions. Otherwise use exactly what the admin chose.
+      const choice = customColumns ? customColumns[header] : suggested[header];
+      if (choice === 'public' || choice === 'internal') {
+        mapped.push({ col, header, custom: choice, field: `custom:${header}` });
+        custom.push({ header, visibility: choice });
+      } else ignored.push(header);
+    }
     else if (m.group) mapped.push({ col, header, group: m.group, sub: m.sub, index: m.index, field: `${m.group}.${m.sub}` });
     else mapped.push({ col, header, field: m.field.key, index: m.index });
   });
   const present = new Set(mapped.map((m) => m.field));
   const fallbackPartner = createMissing && defaults.fallbackPartner ? String(defaults.fallbackPartner).trim() : '';
   const missingColumns = FIELDS.filter((f) => f.required && !present.has(f.key)
-    && !(f.key === 'price' && (present.has('salePrice') || present.has('listPrice') || present.has('denominations.price')))
+    && !(f.key === 'price' && (present.has('salePrice') || present.has('listPrice') || present.has('denomination') || present.has('denominations.price')))
     && !(f.key === 'category' && defaults.categoryId)
     && !(f.key === 'partner' && (defaults.partnerId || fallbackPartner))
     && !(f.key === 'duration' && (defaults.duration || present.has('packageDetails')))
@@ -261,6 +317,19 @@ async function planImport(csvText, options) {
   const newCategories = new Map(); // lower name -> display name
   const newPartners = new Map();   // lower name -> { name, city, country }
   const seenSlugs = new Map();     // slug -> first row id
+  const newCountries = new Map();  // key (ISO code or lower name) -> { name, code }
+
+  /** "UAE | Saudi Arabia" -> [{ id | 'new:key', name, flag, created }]. Missing countries are always created. */
+  const pickCountries = (value) => String(value || '').split(/[|;]/).map((x) => x.trim()).filter(Boolean).map((part) => {
+    const iso = findIsoCountry(part);
+    const found = (iso && refs.countries.get(`code:${iso.code.toLowerCase()}`))
+      || refs.countries.get(`name:${part.toLowerCase()}`)
+      || (iso && refs.countries.get(`name:${iso.name.toLowerCase()}`));
+    if (found) return { id: String(found._id), name: found.name, flag: found.flag || flagOf(found.code) };
+    const key = iso ? iso.code : part.toLowerCase();
+    if (!newCountries.has(key)) newCountries.set(key, { name: iso ? iso.name : part, code: iso?.code });
+    return { id: `new:${key}`, name: iso ? iso.name : part, flag: flagOf(iso?.code), created: true };
+  });
 
   /** Resolves a category/partner value to an existing id, a to-be-created "new:" key, the default, or an error. */
   const pickRef = (kind, value, row) => {
@@ -292,7 +361,7 @@ async function planImport(csvText, options) {
     const warnings = [];
     const data = {};
     // Keys whose value came from this row's cells (not from import defaults). Updates only touch these.
-    const fromFile = new Set(Object.keys(raw).filter((k) => !['active', 'listPrice', 'hasDenominations', 'category', 'partner'].includes(k)));
+    const fromFile = new Set(Object.keys(raw).filter((k) => !['active', 'listPrice', 'hasDenominations', 'category', 'partner', 'denomination', '__custom', '__denomError', '__denoms'].includes(k)));
     // `missing: true` marks "required but absent" problems, which do not apply when updating an existing product.
     const need = (field, message) => errors.push({ field, message, missing: true });
 
@@ -309,9 +378,23 @@ async function planImport(csvText, options) {
     if (raw.category) fromFile.add('categoryId');
     if (raw.partner) fromFile.add('partnerId');
 
-    data.city = raw.city || defaults.city;
-    data.country = raw.country || defaults.country;
+    // ---- countries (availability) & location ----
+    const countryRefs = raw.country ? pickCountries(raw.country) : [];
+    if (countryRefs.length) {
+      data.countries = [...new Set(countryRefs.map((c) => c.id))];
+      data.country = countryRefs[0].name;
+      fromFile.add('countries');
+    } else data.country = raw.country || defaults.country;
+    // A country-specific item (e.g. a US gift card) should not inherit the default city.
+    data.city = raw.city || (raw.country ? undefined : defaults.city);
     if (raw.currency) data.currency = raw.currency;
+    if (raw.__denomError) errors.push({ field: 'denomination', message: raw.__denomError });
+    if (raw.__custom) { data.customFields = raw.__custom; fromFile.add('customFields'); }
+    for (const k of ['amountMin', 'amountMax']) {
+      if (raw[k] === undefined) continue;
+      const n = parseNumber(raw[k]);
+      if (n === undefined || Number.isNaN(n)) errors.push({ field: k, message: `"${raw[k]}" is not a number` }); else data[k] = round2(n);
+    }
 
     // ---- prices ----
     const num = (k) => (raw[k] !== undefined ? parseNumber(raw[k]) : undefined);
@@ -330,6 +413,21 @@ async function planImport(csvText, options) {
     fromFile.delete('price'); fromFile.delete('salePrice');
     if (raw.listPrice !== undefined || (raw.price !== undefined && raw.salePrice !== undefined) || (raw.price !== undefined && raw.listPrice === undefined && raw.salePrice === undefined)) fromFile.add('price');
     if (raw.salePrice !== undefined || raw.listPrice !== undefined || (raw.price !== undefined && raw.salePrice === undefined)) fromFile.add('salePrice');
+
+    // ---- denominations: the product's price is the highest one ----
+    if (raw.__denoms) {
+      const bad = raw.__denoms.filter((d) => !(d.value > 0) || Number.isNaN(d.price) || d.price === undefined);
+      if (bad.length) errors.push({ field: 'denominations', message: 'Every denomination needs a positive value and a price' });
+      else {
+        data.denominations = raw.__denoms.map((d) => ({ ...d, value: round2(d.value), price: round2(d.price), ...(d.oldPrice != null && !Number.isNaN(d.oldPrice) && { oldPrice: round2(d.oldPrice) }) }))
+          .sort((a, b) => a.value - b.value);
+        const top = data.denominations[data.denominations.length - 1];
+        data.salePrice = top.price;
+        data.price = Math.max(top.oldPrice ?? top.price, top.price);
+        errors.splice(0, errors.length, ...errors.filter((e) => e.field !== 'price' && e.field !== 'salePrice'));
+        ['denominations', 'price', 'salePrice'].forEach((k) => fromFile.add(k));
+      }
+    }
 
     // ---- content ----
     if (raw.description !== undefined) {
@@ -355,7 +453,7 @@ async function planImport(csvText, options) {
     else if (detail(/^duration$/i)) { data.duration = detail(/^duration$/i).slice(0, 60); fromFile.add('duration'); } else data.duration = defaults.duration;
 
     if (raw.validityDays !== undefined) {
-      const n = parseNumber(raw.validityDays);
+      const n = /^\s*\d+(\.\d+)?\s*$/.test(raw.validityDays) ? Number(raw.validityDays) : periodToDays(raw.validityDays);
       if (ok(n)) data.validityDays = Math.round(n);
       else {
         const t = validityFromText([raw.validityDays]);
@@ -414,31 +512,110 @@ async function planImport(csvText, options) {
       preview: {
         title: data.title, slug: data.slug, category: cat.label, partner: partner.label, newCategory: Boolean(cat.created), newPartner: Boolean(partner.created),
         city: data.city, price: data.price, salePrice: data.salePrice, currency: data.currency || 'AED', status: data.status, image: data.imageUrls?.[0],
+        countries: countryRefs.map(({ name, flag, created }) => ({ name, flag, created: Boolean(created) })),
+        amountMin: data.amountMin, amountMax: data.amountMax,
+        denominations: (data.denominations || []).map((d) => d.value),
+        customFields: (data.customFields || []).length,
       },
     };
   };
 
   const rows = [];
+  // Supplier price lists split one card family over many rows ("PSN UAE 10 USD", "PSN UAE" 20, 100 …).
+  // Rows with the same base title, country, brand, category and currency become ONE product with denominations.
+  const groups = new Map(); // key -> [{ raw, rowNumber, values }]
+  const baseTitle = (title, values, cur) => {
+    if (!title || values.length !== 1) return title;
+    const v = fmtAmount(values[0]).replace('.', '\\.');
+    // the value must stand alone ("PSN 12 USD" is not "PSN 1" + 2 USD)
+    const stripped = title.replace(new RegExp(`(?:\\s+|\\s*[-–]\\s*)${v}(\\.0+)?\\s*(${cur || '[A-Za-z]{3}'})?\\s*$`, 'i'), '').trim();
+    return stripped || title;
+  };
+  const num = (x) => (x === undefined || x === '' ? undefined : parseNumber(x));
+
   body.forEach((cells, i) => {
     const rowNumber = i + 2; // 1-based incl. header, matches spreadsheet row numbers
     const { raw, denominations } = readCells(cells, mapped);
+
+    // Grabsouq-style hasDenominations + denominations[n].* -> one product with those denominations.
     const variants = parseBool(raw.hasDenominations) ? denominations.filter((d) => d.price || d.value) : [];
-    if (!variants.length) { rows.push(buildRow(raw, rowNumber)); return; }
-    // Each denomination becomes its own product (the catalogue has no variant model).
-    variants.forEach((d, k) => {
-      const tag = d.label || [d.currency, d.value].filter(Boolean).join(' ') || `Option ${k + 1}`;
-      rows.push(buildRow({
-        ...raw,
-        title: raw.title ? `${raw.title} - ${tag}` : raw.title,
-        slug: `${raw.slug || raw.title || ''}-${slugify(tag)}`,
-        price: undefined,
-        salePrice: d.price ?? d.value,
-        listPrice: d.oldPrice,
-        currency: d.currency && /^[a-z]{3}$/i.test(d.currency) ? d.currency : raw.currency,
-        imageUrls: d.img && URL_RE.test(d.img) ? [d.img, ...(raw.imageUrls || []).filter((u) => u !== d.img)] : raw.imageUrls,
-      }, `${rowNumber}.${k + 1}`));
-    });
+    if (variants.length) {
+      raw.__denoms = variants.map((d) => {
+        const value = num(d.value ?? d.price); const price = num(d.price ?? d.value);
+        return { value, price, oldPrice: num(d.oldPrice), label: d.label, img: d.img && URL_RE.test(d.img) ? d.img : undefined, attributes: [] };
+      });
+      const cur = variants.find((d) => /^[a-z]{3}$/i.test(d.currency || ''))?.currency;
+      if (cur && !raw.currency) raw.currency = cur;
+      rows.push(buildRow(raw, rowNumber));
+      return;
+    }
+
+    // "DENOMINATION" column: one value, a list or a range (open amount).
+    if (raw.denomination !== undefined) {
+      const d = parseDenomination(raw.denomination);
+      const cur = raw.currency ? String(raw.currency).toUpperCase() : '';
+      if (!d) raw.__denomError = `Denomination "${raw.denomination}" should be a number, a list like "20, 100" or a range like "5-500"`;
+      else if (d.range) {
+        const [min, max] = d.range;
+        Object.assign(raw, { amountMin: raw.amountMin ?? min, amountMax: raw.amountMax ?? max });
+        if (raw.price === undefined && raw.salePrice === undefined) raw.price = String(min);
+      } else {
+        const base = baseTitle(raw.title, d.values, cur);
+        const key = JSON.stringify([(raw.slug || base || '').toLowerCase(), (raw.country || '').toLowerCase(), (raw.partner || '').toLowerCase(), (raw.category || '').toLowerCase(), cur]);
+        if (!groups.has(key)) { groups.set(key, []); rows.push({ __group: key }); } // keep file order
+        groups.get(key).push({ raw, rowNumber, values: d.values, base });
+        return;
+      }
+    }
+    rows.push(buildRow(raw, rowNumber));
   });
+
+  // Build one product per group.
+  for (let i = 0; i < rows.length; i += 1) {
+    if (!rows[i].__group) continue;
+    const members = groups.get(rows[i].__group);
+    const first = members[0];
+    const values = [...new Set(members.flatMap((m) => m.values))];
+    const rowId = members.length > 1 ? `${first.rowNumber} +${members.length - 1}` : first.rowNumber;
+    if (values.length === 1) {
+      // A single value stays a plain product with that price, under its original title.
+      const raw = { ...first.raw };
+      if (raw.price === undefined && raw.salePrice === undefined) raw.price = String(values[0]);
+      rows[i] = buildRow(raw, rowId);
+      continue;
+    }
+    // Denominations carry each source row's extra columns (e.g. its own margin).
+    const seen = new Set();
+    const dupes = [];
+    const denoms = [];
+    for (const m of members) {
+      for (const value of m.values) {
+        if (seen.has(value)) { dupes.push(value); continue; }
+        seen.add(value);
+        denoms.push({ value, price: value, attributes: (m.raw.__custom || []).map(({ label, value: v, public: pub }) => ({ label, value: v, public: pub })) });
+      }
+    }
+    // Extra fields that are the same for every denomination belong to the product; the rest stay per denomination.
+    const labels = [...new Set(denoms.flatMap((d) => d.attributes.map((a) => a.label)))];
+    const productFields = [];
+    for (const label of labels) {
+      const vals = denoms.map((d) => d.attributes.find((a) => a.label === label)?.value ?? '');
+      if (vals.every((v) => v === vals[0])) {
+        const a = denoms[0].attributes.find((x) => x.label === label);
+        productFields.push({ key: slugify(label).slice(0, 80), label, value: vals[0], public: Boolean(a?.public) });
+        for (const d of denoms) d.attributes = d.attributes.filter((x) => x.label !== label);
+      }
+    }
+    const raw = {
+      ...first.raw, title: first.base, price: undefined, salePrice: undefined, listPrice: undefined, __denoms: denoms,
+      __custom: productFields.length ? productFields : undefined,
+    };
+    if (!raw.__custom) delete raw.__custom;
+    const row = buildRow(raw, rowId);
+    if (dupes.length) row.warnings.push(`Denomination${dupes.length > 1 ? 's' : ''} ${[...new Set(dupes)].join(', ')} listed more than once; kept the first`);
+    if (members.length > 1) row.warnings.push(`Combined ${members.length} rows (${members.map((m) => m.rowNumber).join(', ')}) into one product`);
+    rows[i] = row;
+  }
   if (rows.length > MAX_PRODUCTS) throw ApiError.badRequest(`This file expands to ${rows.length} products; import up to ${MAX_PRODUCTS} at a time`);
 
   // ---- existing products (by slug) decide create / update / skip, then schema validation ----
@@ -459,15 +636,22 @@ async function planImport(csvText, options) {
       r.errors = r.errors.filter((e) => !e.missing);
     }
     // Same rules as the product form. Placeholder ids stand in for categories/partners created on commit.
-    const parsed = schema.safeParse({ ...candidate, categoryId: placeholder(candidate.categoryId), partnerId: placeholder(candidate.partnerId) });
+    const parsed = schema.safeParse({
+      ...candidate,
+      categoryId: placeholder(candidate.categoryId),
+      partnerId: placeholder(candidate.partnerId),
+      ...(candidate.countries && { countries: candidate.countries.map(placeholder) }),
+    });
     if (parsed.success) {
       r.data = { ...parsed.data };
       if (candidate.categoryId !== undefined) r.data.categoryId = candidate.categoryId; else delete r.data.categoryId;
       if (candidate.partnerId !== undefined) r.data.partnerId = candidate.partnerId; else delete r.data.partnerId;
+      if (candidate.countries !== undefined) r.data.countries = candidate.countries;
     } else {
       for (const issue of parsed.error.issues) {
         const field = String(issue.path[0] || 'row');
         if ((field === 'categoryId' || field === 'partnerId') && r.errors.some((e) => e.field === field.replace('Id', ''))) continue;
+        if (field === 'price' && r.errors.some((e) => e.field === 'denomination')) continue;
         if (r.errors.some((e) => e.field === field)) continue;
         const label = FIELD[field]?.label || field;
         const where = issue.path.length > 1 ? ` (item ${Number(issue.path[1]) + 1})` : '';
@@ -493,19 +677,25 @@ async function planImport(csvText, options) {
     .map((r) => r.data[prefix]).filter((x) => String(x).startsWith('new:')).map((x) => x.slice(4)));
   const usedCats = used('categoryId');
   const usedPartners = used('partnerId');
+  const usedCountries = new Set(rows.filter((r) => r.action === 'create' || r.action === 'update')
+    .flatMap((r) => r.data.countries || []).filter((x) => String(x).startsWith('new:')).map((x) => x.slice(4)));
 
   const count = (a) => rows.filter((r) => r.action === a).length;
   return {
     totalRows: body.length,
     totalProducts: rows.length,
-    columns: { mapped: mapped.map(({ header, field, index }) => ({ header, field, index })), ignored, missing: missingColumns },
+    columns: {
+      mapped: mapped.filter((m) => !m.custom).map(({ header, field, index }) => ({ header, field, index })),
+      custom, suggested, ignored, missing: missingColumns,
+    },
     summary: { create: count('create'), update: count('update'), skip: count('skip'), error: count('error') },
     newReferences: {
       categories: [...newCategories].filter(([k]) => usedCats.has(k)).map(([, n]) => n),
       partners: [...newPartners].filter(([k]) => usedPartners.has(k)).map(([, p]) => p.name),
+      countries: [...newCountries].filter(([k]) => usedCountries.has(k)).map(([, c]) => c.name),
     },
     rows,
-    _new: { categories: newCategories, partners: newPartners },
+    _new: { categories: newCategories, partners: newPartners, countries: newCountries },
     _defaults: defaults,
   };
 }
@@ -549,7 +739,17 @@ async function commitImport(plan, userId) {
     idFor.set(`partner:${key}`, String(doc._id));
   }
 
-  const results = { created: 0, updated: 0, failed: [] };
+  const usedCountries = new Set(actionable.flatMap((r) => r.data.countries || []).filter((x) => String(x).startsWith('new:')).map((x) => x.slice(4)));
+  for (const [key, c] of plan._new.countries || []) {
+    if (!usedCountries.has(key)) continue;
+    // eslint-disable-next-line no-await-in-loop
+    let doc = await Country.findOne(c.code ? { code: c.code } : { name: c.name }).collation({ locale: 'en', strength: 2 }).select('_id').lean();
+    // eslint-disable-next-line no-await-in-loop
+    if (!doc) doc = await Country.create({ name: c.name, code: c.code, status: 'ACTIVE', createdBy: userId });
+    idFor.set(`country:${key}`, String(doc._id));
+  }
+
+  const results = { created: 0, updated: 0, failed: [], createdIds: [], notActiveIds: [] };
   const BATCH = 25;
   for (let i = 0; i < actionable.length; i += BATCH) {
     // eslint-disable-next-line no-await-in-loop
@@ -557,13 +757,23 @@ async function commitImport(plan, userId) {
       const data = { ...r.data };
       if (String(data.categoryId).startsWith('new:')) data.categoryId = idFor.get(`cat:${data.categoryId.slice(4)}`);
       if (String(data.partnerId).startsWith('new:')) data.partnerId = idFor.get(`partner:${data.partnerId.slice(4)}`);
+      if (data.countries) data.countries = data.countries.map((id) => (String(id).startsWith('new:') ? idFor.get(`country:${id.slice(4)}`) : id));
       try {
         if (r.action === 'create') {
-          await Product.create({ ...data, createdBy: userId });
+          const doc = await Product.create({ ...data, createdBy: userId });
           results.created += 1;
+          results.createdIds.push(String(doc._id));
+          // Draft / inactive products don't show on the website; the import screen offers to activate them.
+          if (doc.status !== 'ACTIVE') results.notActiveIds.push(String(doc._id));
         } else {
           const doc = await Product.findById(r.existingId);
           if (!doc) throw new Error('Product was deleted during the import');
+          if (data.customFields) {
+            // Merge by key: imported values win, fields added by hand in the admin are kept.
+            const merged = new Map((doc.customFields || []).map((f) => [f.key || f.label, f.toObject ? f.toObject() : f]));
+            for (const f of data.customFields) merged.set(f.key || f.label, f);
+            data.customFields = [...merged.values()];
+          }
           doc.set(data);
           doc.updatedBy = userId;
           await doc.save();
@@ -579,6 +789,7 @@ async function commitImport(plan, userId) {
   results.createdReferences = {
     categories: [...plan._new.categories].filter(([k]) => idFor.has(`cat:${k}`)).map(([, n]) => n),
     partners: [...plan._new.partners].filter(([k]) => idFor.has(`partner:${k}`)).map(([, p]) => p.name),
+    countries: [...(plan._new.countries || [])].filter(([k]) => idFor.has(`country:${k}`)).map(([, c]) => c.name),
   };
   return results;
 }

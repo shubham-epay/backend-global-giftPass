@@ -5,6 +5,9 @@ const ApiError = require('../../utils/ApiError');
 const asyncHandler = require('../../utils/asyncHandler');
 const { escapeRegex } = require('../../utils/helpers');
 const { PRODUCT_CARD_FIELDS, GIFT_BOX_CARD_FIELDS } = require('../../services/pricing.service');
+const { activeCountries, countryScope } = require('../../services/countryScope.service');
+
+const COUNTRY_PUBLIC = 'name code flag';
 
 const PARTNER_PUBLIC = 'name city country address website logoUrl coverImageUrl galleryUrls workingHours description';
 const CATEGORY_PUBLIC = 'name slug description iconUrl bannerUrl parentCategoryId sortOrder seoTitle seoDescription';
@@ -18,7 +21,9 @@ const SORTS = {
   title: { title: 1, _id: 1 },
 };
 
-const publicCache = (res, seconds = 60) => res.set('Cache-Control', `public, max-age=${seconds}, stale-while-revalidate=${seconds * 5}`);
+// Browsers must re-check with the server each time (answered with a cheap 304 via ETag when nothing changed),
+// so admin changes such as hiding a country or activating products show up immediately.
+const publicCache = (res) => res.set('Cache-Control', 'public, no-cache');
 
 const activeBannerFilter = (placement) => {
   const now = new Date();
@@ -52,10 +57,14 @@ const publicBanner = (b) => ({
   endDate: b.endDate,
 });
 
-const cards = (filter, { sort = SORTS.newest, limit = 12, skip = 0 } = {}) => Product.find({ status: 'ACTIVE', ...filter })
+/** Adds the visitor's country scope to a product filter (kept in $and so it never clashes with a search $or). */
+const scoped = (filter, scope) => (scope ? { ...filter, $and: [...(filter.$and || []), scope] } : filter);
+
+const cards = (filter, { sort = SORTS.newest, limit = 12, skip = 0, scope } = {}) => Product.find(scoped({ status: 'ACTIVE', ...filter }, scope))
   .select(PRODUCT_CARD_FIELDS)
   .populate('categoryId', 'name slug')
   .populate('partnerId', 'name city')
+  .populate('countries', COUNTRY_PUBLIC)
   .sort(sort).skip(skip).limit(limit).lean();
 
 /** Shared product-list filter from query string (city, price range, merchandising flags). */
@@ -71,7 +80,7 @@ function listFilter(query) {
 
 async function paginated(res, filter, query, extra = {}) {
   const { page, limit, sort } = query;
-  const full = { status: 'ACTIVE', ...filter };
+  const full = scoped({ status: 'ACTIVE', ...filter }, await countryScope(query.countries));
   const [items, total] = await Promise.all([
     cards(full, { sort: SORTS[sort] || SORTS.newest, limit, skip: (page - 1) * limit }),
     Product.countDocuments(full),
@@ -93,16 +102,17 @@ async function descendantIds(rootId) {
 }
 
 // ---------------- Homepage ----------------
-const home = asyncHandler(async (_req, res) => {
+const home = asyncHandler(async (req, res) => {
+  const scope = await countryScope(req.query.countries);
   const [banners, categories, featured, bestSellers, flashSale, newArrivals, collections, giftBoxes] = await Promise.all([
     Banner.find(activeBannerFilter()).select('-createdBy -updatedBy').sort({ sortOrder: 1, createdAt: -1 }).lean(),
     Category.find({ status: 'ACTIVE', parentCategoryId: null }).select(CATEGORY_PUBLIC).sort({ sortOrder: 1, name: 1 }).lean(),
-    cards({ featured: true }, { limit: 12 }),
-    cards({ bestSeller: true }, { sort: SORTS.popular, limit: 12 }),
-    cards({ flashSale: true }, { limit: 12 }),
-    cards({}, { limit: 12 }),
+    cards({ featured: true }, { limit: 12, scope }),
+    cards({ bestSeller: true }, { sort: SORTS.popular, limit: 12, scope }),
+    cards({ flashSale: true }, { limit: 12, scope }),
+    cards({}, { limit: 12, scope }),
     CuratedCollection.find({ status: 'ACTIVE', showOnHome: true }).select('-createdBy -updatedBy').sort({ sortOrder: 1 }).limit(6)
-      .populate({ path: 'productIds', match: { status: 'ACTIVE' }, select: PRODUCT_CARD_FIELDS, options: { limit: 12 } })
+      .populate({ path: 'productIds', match: scoped({ status: 'ACTIVE' }, scope), select: PRODUCT_CARD_FIELDS, options: { limit: 12 } })
       .lean(),
     GiftBox.find({ status: 'ACTIVE' }).select(GIFT_BOX_CARD_FIELDS).sort({ createdAt: -1 }).limit(8).lean(),
   ]);
@@ -132,16 +142,17 @@ const banners = asyncHandler(async (req, res) => {
 });
 
 const featuredProducts = asyncHandler(async (req, res) => {
-  const items = await cards({ featured: true }, { limit: req.query.limit });
+  const items = await cards({ featured: true }, { limit: req.query.limit, scope: await countryScope(req.query.countries) });
   publicCache(res);
   res.json({ success: true, data: items });
 });
 
 // ---------------- Categories ----------------
-const categories = asyncHandler(async (_req, res) => {
+const categories = asyncHandler(async (req, res) => {
+  const scope = await countryScope(req.query.countries);
   const [all, counts] = await Promise.all([
     Category.find({ status: 'ACTIVE' }).select(CATEGORY_PUBLIC).sort({ sortOrder: 1, name: 1 }).lean(),
-    Product.aggregate([{ $match: { status: 'ACTIVE' } }, { $group: { _id: '$categoryId', n: { $sum: 1 } } }]),
+    Product.aggregate([{ $match: scoped({ status: 'ACTIVE' }, scope) }, { $group: { _id: '$categoryId', n: { $sum: 1 } } }]),
   ]);
   const countBy = new Map(counts.map((c) => [String(c._id), c.n]));
   const byParent = new Map();
@@ -152,7 +163,7 @@ const categories = asyncHandler(async (_req, res) => {
     byParent.get(key).push(c);
   }
   const build = (key, depth = 0) => (depth > 5 ? [] : (byParent.get(key) || []).map((c) => ({ ...c, children: build(String(c._id), depth + 1) })));
-  publicCache(res, 300);
+  publicCache(res);
   res.json({ success: true, data: build('root') });
 });
 
@@ -175,17 +186,24 @@ const products = asyncHandler(async (req, res) => {
 
 // ---------------- Product ----------------
 const productDetail = asyncHandler(async (req, res) => {
-  const product = await Product.findOne({ slug: req.params.slug, status: 'ACTIVE' })
+  // Direct links work whatever the visitor selected, but products sold only in hidden countries are not shown.
+  const found = await Product.findOne(scoped({ slug: req.params.slug, status: 'ACTIVE' }, await countryScope()))
     .select('-supplierReference -apiDeliveryId -createdBy -updatedBy -soldCount')
     .populate('categoryId', 'name slug parentCategoryId')
     .populate('partnerId', PARTNER_PUBLIC)
+    .populate('countries', COUNTRY_PUBLIC)
     .lean();
-  if (!product) throw ApiError.notFound('Product');
+  if (!found) throw ApiError.notFound('Product');
+  // Custom fields: only the public ones leave the API, as simple label / value "attributes".
+  const { customFields = [], ...product } = found;
+  // Per-denomination attributes (e.g. margin) are internal.
+  product.denominations = (product.denominations || []).map(({ attributes, ...d }) => d);
+  product.attributes = customFields.filter((f) => f.public && f.value).map(({ label, value }) => ({ label, value }));
 
   const [reviews, related] = await Promise.all([
     Review.find({ productId: product._id, status: 'APPROVED' }).select('rating title comment createdAt userId')
       .populate('userId', 'name').sort({ createdAt: -1 }).limit(10).lean(),
-    cards({ categoryId: product.categoryId?._id, _id: { $ne: product._id } }, { sort: SORTS.popular, limit: 8 }),
+    cards({ categoryId: product.categoryId?._id, _id: { $ne: product._id } }, { sort: SORTS.popular, limit: 8, scope: await countryScope(req.query.countries) }),
   ]);
   publicCache(res);
   res.json({
@@ -196,6 +214,13 @@ const productDetail = asyncHandler(async (req, res) => {
       related,
     },
   });
+});
+
+// ---------------- Countries (storefront picker) ----------------
+const countries = asyncHandler(async (_req, res) => {
+  const items = await activeCountries();
+  publicCache(res);
+  res.json({ success: true, data: items.map(({ _id, name, code, flag, currency }) => ({ _id, name, code, flag, currency })) });
 });
 
 // ---------------- Search ----------------
@@ -210,5 +235,5 @@ const search = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
-  home, banners, featuredProducts, categories, categoryProducts, products, productDetail, search,
+  home, banners, featuredProducts, categories, categoryProducts, products, productDetail, search, countries,
 };

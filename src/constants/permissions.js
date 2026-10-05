@@ -14,6 +14,7 @@ const PERMISSION_GROUPS = [
     { key: 'categories.manage', label: 'Manage categories' },
     { key: 'partners.manage', label: 'Manage partners' },
     { key: 'giftBoxes.manage', label: 'Manage gift boxes' },
+    { key: 'countries.manage', label: 'Manage countries' },
   ] },
   { group: 'Coupons', permissions: [
     { key: 'coupons.read', label: 'View coupons' },

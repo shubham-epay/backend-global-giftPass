@@ -60,6 +60,11 @@ router.delete('/roles/:id', authorize('roles.manage'), validate({ params: idPara
 router.use('/categories', resourceRouter(catalog.categories, v.category, {
   read: ['categories.manage', ...CATALOG_PICKERS], create: ['categories.manage'], update: ['categories.manage'], delete: ['categories.manage'],
 }));
+const COUNTRY_READ = ['countries.manage', 'products.read', 'products.create', 'products.update'];
+router.get('/countries/iso', authorize('countries.manage'), catalog.isoCountries);
+router.use('/countries', resourceRouter(catalog.countries, v.country, {
+  read: COUNTRY_READ, create: ['countries.manage'], update: ['countries.manage'], delete: ['countries.manage'],
+}));
 router.use('/partners', resourceRouter(catalog.partners, v.partner, {
   read: ['partners.manage', ...CATALOG_PICKERS, 'vouchers.update'], create: ['partners.manage'], update: ['partners.manage'], delete: ['partners.manage'],
 }));
@@ -68,6 +73,7 @@ const csvBody = express.text({ type: ['text/csv', 'text/plain', 'application/csv
 router.get('/products/import/template', authorize('products.create'), productImport.template);
 router.get('/products/import/fields', authorize('products.create'), productImport.fields);
 router.post('/products/import', authorize('products.create'), csvBody, validate({ query: v.productImportQuery }), productImport.importProducts);
+router.post('/products/bulk', authorize('products.update', 'products.delete'), validate({ body: v.productBulk }), catalog.productBulk);
 router.use('/products', resourceRouter(catalog.products, v.product, {
   read: [...CATALOG_PICKERS, 'vouchers.create'], create: ['products.create'], update: ['products.update'], delete: ['products.delete'],
 }));

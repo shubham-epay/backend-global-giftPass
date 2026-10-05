@@ -17,6 +17,7 @@ const { audit, diff } = require('../../services/audit.service');
  *  populate      mongoose populate spec for list and detail
  *  listSelect    projection for list
  *  hooks         { beforeCreate(req, data), beforeUpdate(req, doc, data), beforeDelete(req, doc) }
+ *  decorate      async (items) => items   adds computed fields to list rows (e.g. usage counts)
  */
 function crudController(Model, options) {
   const {
@@ -70,7 +71,8 @@ function crudController(Model, options) {
     let query = Model.find(filter).sort(buildSort(sort)).skip((page - 1) * limit).limit(limit);
     if (listSelect) query = query.select(listSelect);
     if (populate.length) query = query.populate(populate);
-    const [items, total] = await Promise.all([query.lean({ virtuals: true }), Model.countDocuments(filter)]);
+    let [items, total] = await Promise.all([query.lean({ virtuals: true }), Model.countDocuments(filter)]);
+    if (options.decorate) items = await options.decorate(items);
     res.json({ success: true, data: items, meta: { page, limit, total, totalPages: Math.ceil(total / limit) || 1 } });
   });
 
@@ -116,7 +118,10 @@ function crudController(Model, options) {
     res.json({ success: true, data: { _id: doc._id } });
   });
 
-  return { list, getOne, create, update, remove };
+  // Same filter the list endpoint builds from a query string (used by bulk actions: "all matching").
+  const filterFromQuery = (query) => buildFilter(query);
+
+  return { list, getOne, create, update, remove, filterFromQuery };
 }
 
 module.exports = { crudController };

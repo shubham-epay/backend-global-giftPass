@@ -1,5 +1,5 @@
 const { Schema, model } = require('mongoose');
-const { ORDER_STATUS, PAYMENT_STATUS } = require('../constants/enums');
+const { ORDER_STATUS, PAYMENT_STATUS, PAYMENT_METHODS } = require('../constants/enums');
 const { money, ref, addressSchema } = require('./_shared');
 
 const statusHistorySchema = new Schema({
@@ -13,7 +13,8 @@ const statusHistorySchema = new Schema({
 
 const orderSchema = new Schema({
   orderNumber: { type: String, required: true, trim: true, uppercase: true },
-  userId: ref('User', { required: true }),
+  userId: ref('User'), // absent for guest checkouts
+  isGuest: { type: Boolean, default: false },
   customer: {
     name: { type: String, trim: true, maxlength: 120 },
     email: { type: String, trim: true, lowercase: true, maxlength: 254 },
@@ -34,6 +35,9 @@ const orderSchema = new Schema({
   statusHistory: { type: [statusHistorySchema], default: [] },
 
   deliveryMethod: { type: String, enum: ['EMAIL', 'SMS', 'PHYSICAL'], default: 'EMAIL' },
+  paymentMethod: { type: String, enum: PAYMENT_METHODS, default: 'CARD' },
+  // SHA-256 of the one-time token given to the shopper at checkout; lets a guest pay / check this order.
+  payTokenHash: { type: String, select: false },
   billingAddress: addressSchema,
   shippingAddress: addressSchema,
   trackingNumber: { type: String, trim: true, maxlength: 120 },

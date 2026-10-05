@@ -12,7 +12,17 @@ const {
  * dryRun=true validates and returns the plan without writing anything.
  */
 const importProducts = asyncHandler(async (req, res) => {
-  const { dryRun, mode, createMissing, ...defaults } = req.query;
+  const { dryRun, mode, createMissing, customColumns: customRaw, ...defaults } = req.query;
+  let customColumns;
+  if (customRaw) {
+    try {
+      const parsed = JSON.parse(customRaw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object');
+      customColumns = Object.fromEntries(Object.entries(parsed).filter(([, v]) => v === 'public' || v === 'internal' || v === 'ignore'));
+    } catch {
+      throw ApiError.badRequest('customColumns must be a JSON object such as {"Margin":"internal"}');
+    }
+  }
   if (typeof req.body !== 'string' || !req.body.trim()) {
     throw ApiError.badRequest('Upload a CSV file (Content-Type: text/csv)');
   }
@@ -20,7 +30,7 @@ const importProducts = asyncHandler(async (req, res) => {
     throw ApiError.forbidden('Updating existing products needs the "Edit products" permission');
   }
 
-  const plan = await planImport(req.body, { mode, createMissing, defaults });
+  const plan = await planImport(req.body, { mode, createMissing, defaults, customColumns });
   if (dryRun) return res.json({ success: true, data: { dryRun: true, mode, ...publicPlan(plan) } });
 
   if (plan.summary.create + plan.summary.update === 0) {

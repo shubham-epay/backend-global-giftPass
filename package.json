@@ -4,7 +4,9 @@
   "private": true,
   "description": "Global Gift Pass - Admin Backend API (Express + MongoDB, MVC)",
   "main": "server.js",
-  "engines": { "node": ">=18.18" },
+  "engines": {
+    "node": ">=18.18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
@@ -23,6 +25,7 @@
     "helmet": "^8.0.0",
     "hpp": "^0.2.3",
     "jsonwebtoken": "^9.0.2",
+    "libphonenumber-js": "^1.13.14",
     "mongoose": "^8.8.4",
     "morgan": "^1.10.0",
     "zod": "^3.23.8"

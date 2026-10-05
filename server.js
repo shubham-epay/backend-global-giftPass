@@ -1,6 +1,7 @@
 const config = require('./src/config/env');
 const { connectDB, disconnectDB } = require('./src/config/db');
 const app = require('./src/app');
+const paymentReconciler = require('./src/services/paymentReconciler');
 
 let server;
 
@@ -9,10 +10,13 @@ async function start() {
   server = app.listen(config.PORT, () => {
     console.log(`[api] Global Gift Pass admin API listening on :${config.PORT} (${config.NODE_ENV})`);
   });
+  // Keeps payments/orders in step with SynraPay via Get Status, with or without webhooks.
+  paymentReconciler.start();
 }
 
 async function shutdown(signal) {
   console.log(`[api] ${signal} received, shutting down gracefully...`);
+  paymentReconciler.stop();
   if (server) await new Promise((resolve) => server.close(resolve));
   await disconnectDB();
   process.exit(0);

@@ -31,12 +31,17 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id', 'X-Cart-Token', 'X-Payment-Token'],
   exposedHeaders: ['X-Request-Id', 'RateLimit', 'RateLimit-Policy'],
   maxAge: 600,
 }));
 app.use(compression());
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({
+  limit: '1mb',
+  // The payment webhook is signed over the exact bytes received, so keep them - for that route only
+  // (other payment routes can carry card details, which must not be kept around).
+  verify: (req, _res, buf) => { if (req.originalUrl.split('?')[0] === '/api/payments/synrapay/webhook') req.rawBody = buf.toString('utf8'); },
+}));
 app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 app.use(cookieParser());
 app.use(mongoSanitize({ replaceWith: '_' }));
