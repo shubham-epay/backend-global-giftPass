@@ -91,6 +91,9 @@ module.exports = {
     pay: (body) => request('POST', '/direct/payment', body, { acceptStatuses: [402], timeoutMs: 45000 }),
     authenticate: (orderId) => request('POST', `/direct/payment/${enc(orderId)}/authenticate`, {}, { acceptStatuses: [402], timeoutMs: 45000 }),
     status: (orderId) => request('GET', `/direct/payment/${enc(orderId)}/status`),
+    // No amount: takes everything the authorization holds.
+    capture: (orderId) => request('POST', `/direct/payment/${enc(orderId)}/capture`, {}, { timeoutMs: 45000 }),
+    void: (orderId, reason) => request('POST', `/direct/payment/${enc(orderId)}/void`, reason ? { reason } : {}, { timeoutMs: 45000 }),
   },
   paymentLinks: {
     create: (body) => request('POST', '/payment-link/create', body),

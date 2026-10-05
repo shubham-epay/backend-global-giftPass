@@ -3,10 +3,10 @@ const { parsePhoneNumberFromString } = require('libphonenumber-js/max');
 const config = require('../config/env');
 const ApiError = require('../utils/ApiError');
 const { runInTransaction } = require('../utils/transaction');
-const { Order, Payment, Voucher } = require('../models');
+const { Order, OrderItem, Payment, Voucher } = require('../models');
+const { COUNTRIES } = require('../constants/countries');
 const { REVENUE_ORDER_STATUSES } = require('../constants/enums');
 const synrapay = require('./synrapay.service');
-const webhookLog = require('./webhookLog.service');
 
 /**
  * Online payment for storefront orders through SynraPay.
@@ -55,11 +55,45 @@ function synraCustomer(order) {
   return c;
 }
 
+/** ISO country code for a stored address (addresses keep the country's name). Undefined when unknown. */
+const isoCountry = (name) => COUNTRIES.find((c) => c.name === name || c.code === name)?.code;
+
+/** Optional Create Session address block: only values SynraPay will accept (a malformed field is a 400). */
+function synraAddress(a) {
+  if (!a) return undefined;
+  const out = {};
+  const country = isoCountry(a.country);
+  if (country) out.country = country;
+  if (a.city) out.city = a.city;
+  if (a.line1) out.street = [a.line1, a.line2].filter(Boolean).join(', ').slice(0, 200);
+  if (a.postalCode) out.postalCode = a.postalCode;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** Customer address and line items for Create Session. Shown on the SynraPay dashboard; they don't change what is charged. */
+async function sessionDetails(order) {
+  const billing = synraAddress(order.billingAddress);
+  const shipping = synraAddress(order.shippingAddress);
+  const items = (await OrderItem.find({ orderId: order._id }).limit(100).lean()).map((it) => ({
+    merchantItemId: String(it.productId || it.giftBoxId || it._id),
+    name: String(it.titleSnapshot || 'Item').slice(0, 200),
+    count: it.quantity,
+    price: it.unitPrice,
+  })).filter((it) => Number.isInteger(it.count) && it.count >= 1 && it.price >= 0);
+  return {
+    ...((billing || shipping) && { address: { ...(billing && { billing }), ...(shipping && { shipping }) } }),
+    ...(items.length && { items }),
+  };
+}
+
 /**
  * Only our own storefronts may be a return target, and SynraPay accepts https return URLs only
  * ("returnUrls.success must use https"), so http://localhost and anything else fall back to STOREFRONT_URL.
  */
 const storefrontFor = (origin) => (origin && origin.startsWith('https://') && config.corsOrigins.includes(origin) ? origin : config.STOREFRONT_URL);
+
+/** The page origin a Hosted Session is created for: the storefront the shopper is on when it is one of ours (http://localhost included). */
+const sessionOriginFor = (origin) => (origin && config.corsOrigins.includes(origin) ? origin : new URL(config.STOREFRONT_URL).origin);
 
 const returnUrls = (order, origin) => {
   const back = `${storefrontFor(origin)}/pay/${encodeURIComponent(order.orderNumber)}`;
@@ -119,6 +153,16 @@ const orderPaymentView = (order) => ({
 });
 
 // ---------------- start an attempt ----------------
+/** PAID, or AUTHORIZED: the amount is held on the shopper's card, waiting to be captured or voided. */
+const isSettled = (order) => order.paymentStatus === 'PAID' || order.paymentStatus === 'AUTHORIZED';
+
+function assertPayable(order) {
+  if (!isSettled(order) && order.orderStatus === 'PENDING') return;
+  const message = order.paymentStatus === 'PAID' ? 'This order is already paid'
+    : order.paymentStatus === 'AUTHORIZED' ? 'A payment for this order is already authorized' : 'This order can no longer be paid';
+  throw new ApiError(409, 'ORDER_NOT_PAYABLE', message);
+}
+
 /** A still-payable link from an earlier attempt is deleted first so the order can't be paid twice. */
 async function retirePreviousLinks(order) {
   const open = await Payment.find({ orderId: order._id, provider: PROVIDER, method: 'PAY_BY_LINK', status: { $ne: 'PAID' }, 'link.status': 'ACTIVE' });
@@ -147,9 +191,7 @@ async function retirePreviousLinks(order) {
  */
 async function startPayment(order, method, opts = {}) {
   if (!SYNRAPAY_METHODS.includes(method)) throw new ApiError(400, 'UNSUPPORTED_PAYMENT_METHOD', 'This payment method is not available');
-  if (order.paymentStatus === 'PAID' || order.orderStatus !== 'PENDING') {
-    throw new ApiError(409, 'ORDER_NOT_PAYABLE', order.paymentStatus === 'PAID' ? 'This order is already paid' : 'This order can no longer be paid');
-  }
+  assertPayable(order);
 
   await retirePreviousLinks(order);
   const attempt = (await Payment.countDocuments({ orderId: order._id, provider: PROVIDER })) + 1;
@@ -161,9 +203,36 @@ async function startPayment(order, method, opts = {}) {
   let clientToken;
   const fields = {};
   if (method === 'HOSTED_SESSION') {
-    // No `origin`: SynraPay checks it against the website registered at onboarding and refuses
-    // others (ORIGIN_NOT_REGISTERED); without it the session is created for the account's website.
-    data = await synrapay.hostedSessions.create(body);
+    // The client token only works on the origin it was created for, and SynraPay needs `origin` sent
+    // once more than one is registered (e.g. the live site and http://localhost:5174).
+    const origin = sessionOriginFor(opts.origin);
+    const { address, items } = await sessionDetails(order);
+    // Full Create Session body: the order, plus the optional customer address, line items and origin.
+    let session = {
+      ...body,
+      customer: { ...body.customer, ...(address && { address }) },
+      ...(items && { order: { items } }),
+      origin,
+    };
+    let detailed = Boolean(address || items);
+    for (;;) {
+      try {
+        data = await synrapay.hostedSessions.create(session); // eslint-disable-line no-await-in-loop
+        break;
+      } catch (err) {
+        if (err.code === 'ORIGIN_NOT_REGISTERED' && session.origin) {
+          // Not registered on the SynraPay account: use the account's own origin, so the order can
+          // still be paid there or on fallbackCheckoutUrl.
+          console.warn(`[payments] ${merchantOrderId}: origin ${origin} is not registered with SynraPay - register it to use the card form there`);
+          session = { ...session, origin: undefined };
+        } else if (err.code === 'VALIDATION_ERROR' && detailed) {
+          // The address and items are optional extras: never let one of them stop the payment.
+          console.warn(`[payments] ${merchantOrderId}: SynraPay refused the optional order details (${JSON.stringify(err.details || err.message)}) - creating the session without them`);
+          session = { ...body, origin: session.origin };
+          detailed = false;
+        } else throw err;
+      }
+    }
     clientToken = data.clientToken;
     fields.session = { sessionId: data.sessionId, expiresAt: data.expiresAt, fallbackCheckoutUrl: data.fallbackCheckoutUrl };
   } else if (method === 'PAY_BY_LINK') {
@@ -272,13 +341,13 @@ async function applyResult(merchantOrderId, result) {
     }
 
     // Never fulfil a payment that doesn't match what we asked for.
-    if (to === 'PAID' && ((result.amount != null && Math.abs(Number(result.amount) - payment.amount) > 0.005)
+    if ((to === 'PAID' || to === 'AUTHORIZED') && ((result.amount != null && Math.abs(Number(result.amount) - payment.amount) > 0.005)
       || (result.currency && String(result.currency).toUpperCase() !== payment.currency))) {
       payment.reviewRequired = true;
       payment.events.push({ type: 'amount_mismatch', providerEventId: result.eventId, amount: Number(result.amount) || undefined });
       remember();
       await payment.save({ session });
-      console.error(`[payments] ${merchantOrderId}: paid ${result.amount} ${result.currency}, expected ${payment.amount} ${payment.currency} - needs review`);
+      console.error(`[payments] ${merchantOrderId}: ${to.toLowerCase()} ${result.amount} ${result.currency}, expected ${payment.amount} ${payment.currency} - needs review`);
       return { ignored: 'amount mismatch', payment, order };
     }
 
@@ -319,7 +388,19 @@ async function applyResult(merchantOrderId, result) {
         } else {
           console.warn(`[payments] ${order.orderNumber} was paid while ${order.orderStatus}: refund may be needed`);
         }
-      } else if (to === 'FAILED' && order.paymentStatus !== 'PAID') {
+      } else if (to === 'AUTHORIZED' && isSettled(order) && String(order.paymentId) !== String(payment._id)) {
+        // Another attempt already paid for (or holds the amount for) this order: this hold must be released.
+        payment.reviewRequired = true;
+        payment.events.push({ type: 'duplicate_authorization', status: 'AUTHORIZED', amount: payment.amount, at: now });
+        await payment.save({ session });
+        console.error(`[payments] ${order.orderNumber} authorized twice (${merchantOrderId}) - void the duplicate`);
+      } else if (to === 'AUTHORIZED') {
+        // Held, not taken: the order stays PENDING (nothing is fulfilled) until the capture makes it PAID.
+        order.paymentStatus = 'AUTHORIZED';
+        order.paymentId = payment._id;
+        order.paymentMethod = payment.method;
+      } else if (to === 'FAILED' && !(isSettled(order) && String(order.paymentId) !== String(payment._id))) {
+        // Also a voided authorization. An older attempt failing never undoes another attempt's payment or hold.
         order.paymentStatus = 'FAILED';
       } else if (to === 'PARTIALLY_REFUNDED' && String(order.paymentId) === String(payment._id)) {
         // Part of the money went back: the order stays as it is and its vouchers stay valid.
@@ -347,6 +428,7 @@ async function applyResult(merchantOrderId, result) {
  * The body's `status` decides; the event name is only a fallback.
  */
 function resultFromWebhook(body, event) {
+  if (body.paymentLink) return resultFromLinkWebhook(body, event);
   const masked = String(body.paymentMethod?.maskedCardNumber || '');
   const base = {
     event: event || body.event || undefined,
@@ -366,7 +448,30 @@ function resultFromWebhook(body, event) {
     // On refund events `amount` is still the order amount; the refund block carries the cumulative total.
     return { ...base, status, amount: undefined, refundedTotal: body.refund?.refundedTotal, reason: body.refund?.reason };
   }
+  // A void's `message` is "Approved" (the operation succeeded), which is not why the payment ended.
+  if (body.status === 'voided') return { ...base, status, reason: body.void?.reason || 'Authorization voided' };
   return { ...base, status };
+}
+
+/** Our attempt id in a webhook body: orderId (Hosted), merchant_order_id (Direct API) or the payment link's referenceId. */
+const merchantOrderIdOf = (body = {}) => String(body.orderId || body.merchant_order_id || body.paymentLink?.referenceId || body.order?.orderId || '');
+
+/**
+ * Payment link deliveries (payment.authorized, payment.captured, order.paid, payment_link.paid) use their
+ * own envelope: { status, paymentLink, order, payment }. Their `status` is "success" on every one of them,
+ * so the order block decides: it is paid only when order.status says so.
+ */
+function resultFromLinkWebhook(body, event) {
+  const base = {
+    event: event || body.event || undefined,
+    currency: body.order?.currency || body.paymentLink.currency,
+    cardBrand: body.payment?.card?.brand,
+    cardLast4: body.payment?.card?.last4,
+    source: 'WEBHOOK',
+  };
+  if (String(body.order?.status).toLowerCase() === 'paid') return { ...base, status: 'PAID', amount: body.order.amountPaid ?? body.paymentLink.amountPaid };
+  const status = STATUS_FROM_PROVIDER[body.status];
+  return { ...base, status: status === 'PAID' ? undefined : status, reason: body.payment?.codes?.message || body.message };
 }
 
 // ---------------- reconcile (Get Status) ----------------
@@ -386,7 +491,9 @@ async function reconcilePayment(payment) {
     if (payment.method === 'DIRECT_CARD') {
       if (!payment.direct?.orderId) return { payment, changed: false };
       const st = await synrapay.direct.status(payment.direct.orderId);
-      data = { order_status: st.status, amount: st.captured_amount ?? st.amount, currency: st.currency, reason: st.response_message };
+      // A hold has nothing captured yet: compare what is held, not what was taken.
+      const amount = st.status === 'AUTHORIZED' ? st.authorized_amount ?? st.amount : st.captured_amount ?? st.amount;
+      data = { order_status: st.status, amount, currency: st.currency, reason: st.response_message };
     } else {
       ({ data } = await synrapay.payments.getStatus(payment.merchantOrderId));
     }
@@ -394,23 +501,14 @@ async function reconcilePayment(payment) {
     await Payment.updateOne({ _id: payment._id }, { statusCheckedAt: new Date(), $inc: { statusChecks: 1 }, ...(providerStatus && { providerStatus: String(providerStatus).slice(0, 40) }) });
 
     const to = providerStatus && STATUS_FROM_PROVIDER[providerStatus];
-    if ((to === 'PAID' || to === 'FAILED') && to !== payment.status) {
+    if ((to === 'PAID' || to === 'FAILED' || to === 'AUTHORIZED') && to !== payment.status) {
       const r = await applyResult(payment.merchantOrderId, {
         status: to, amount: data.amount, currency: data.currency, source: 'SYSTEM',
         event: `getstatus.${String(providerStatus).toLowerCase()}`,
         reason: to === 'FAILED' ? (data.decline_reason || data.message || data.reason) : undefined,
       });
       const changed = !r.ignored;
-      if (changed) {
-        console.log(`[payments] ${payment.merchantOrderId}: Get Status ${providerStatus} -> payment ${r.payment.status}, order ${r.order?.orderStatus}`);
-        // No webhook told us this, so write the entry for the `webhook` collection ourselves.
-        await webhookLog.recordResult({
-          source: payment.method === 'DIRECT_CARD' ? 'DIRECT_API' : 'GET_STATUS',
-          event: `getstatus.${String(providerStatus).toLowerCase()}`,
-          payload: data, payment: r.payment, order: r.order,
-          outcome: `payment ${r.payment.status}, order ${r.order?.orderStatus || 'n/a'}`,
-        });
-      }
+      if (changed) console.log(`[payments] ${payment.merchantOrderId}: Get Status ${providerStatus} -> payment ${r.payment.status}, order ${r.order?.orderStatus}`);
       else if (r.ignored !== 'no change') console.warn(`[payments] ${payment.merchantOrderId}: Get Status ${providerStatus} not applied (${r.ignored})`);
       return { payment: r.payment || payment, order: r.order, providerStatus, changed };
     }
@@ -449,13 +547,13 @@ const DIRECT_DECLINE_COPY = {
   INVALID_PAYMENT: 'These card details were not accepted. Please check them and try again.',
 };
 
+/** What the storefront gets once the card went through: PAID, or AUTHORIZED when capture is manual. */
+const settledView = (order) => ({ status: order.paymentStatus, order: orderPaymentView(order) });
+
 /**
  * Turns a Direct API payment / authenticate response into what the storefront needs, applying
  * the outcome to the order. Approved here is authoritative: it is the response to our signed call.
  */
-/** The Direct API response without the 3-D Secure page (it has no card data, but it is bulky HTML). */
-const directPayload = ({ action, ...rest }) => ({ ...rest, message: rest.response_message || rest.error_message, code: rest.response_code || rest.error_code });
-
 async function settleDirect(order, payment, res, card) {
   if (res.status === 'REQUIRES_ACTION' && res.action?.type === '3ds_challenge') {
     await Payment.updateOne({ _id: payment._id }, { 'direct.challenge': true });
@@ -469,16 +567,23 @@ async function settleDirect(order, payment, res, card) {
       event: 'direct.captured', cardLast4: card?.last4,
     });
     await Payment.updateOne({ _id: payment._id }, { 'direct.challenge': false });
-    if (!r.ignored) await webhookLog.recordResult({ source: 'DIRECT_API', event: 'direct.captured', payload: directPayload(res), payment: r.payment, order: r.order, outcome: `payment ${r.payment.status}, order ${r.order?.orderStatus || 'n/a'}` });
     return { status: 'PAID', order: orderPaymentView(r.order || order) };
+  }
+  if (to === 'AUTHORIZED') {
+    // capture: false - the amount is held on the card; an admin captures or voids it later.
+    const r = await applyResult(payment.merchantOrderId, {
+      status: 'AUTHORIZED', amount: res.authorized_amount ?? res.amount, currency: res.currency, source: 'SYSTEM',
+      event: 'direct.authorized', cardLast4: card?.last4,
+    });
+    await Payment.updateOne({ _id: payment._id }, { 'direct.challenge': false });
+    return settledView(r.order || order);
   }
   if (to === 'FAILED') {
     const cancelled = res.status === 'CANCELLED';
-    const f = await applyResult(payment.merchantOrderId, {
+    await applyResult(payment.merchantOrderId, {
       status: 'FAILED', source: 'SYSTEM', event: cancelled ? 'direct.cancelled' : 'direct.declined',
       reason: res.error_message || res.response_message, cardLast4: card?.last4,
     });
-    if (!f.ignored) await webhookLog.recordResult({ source: 'DIRECT_API', event: cancelled ? 'direct.cancelled' : 'direct.declined', payload: directPayload(res), payment: f.payment, order: f.order, outcome: `payment ${f.payment.status}, order ${f.order?.orderStatus || 'n/a'}` });
     await Payment.updateOne({ _id: payment._id }, { 'direct.challenge': false });
     return {
       status: cancelled ? 'CANCELLED' : 'DECLINED',
@@ -488,37 +593,35 @@ async function settleDirect(order, payment, res, card) {
         : DIRECT_DECLINE_COPY[res.error_code] || DIRECT_DECLINE_COPY.PAYMENT_DECLINED,
     };
   }
-  // AUTHORIZED (we always capture) or anything unexpected: let Get Status decide.
+  // Anything unexpected: let Get Status decide.
   const rec = await reconcile(order);
-  return { status: rec.order.paymentStatus === 'PAID' ? 'PAID' : 'PENDING', order: orderPaymentView(rec.order) };
+  return isSettled(rec.order) ? settledView(rec.order) : { status: 'PENDING', order: orderPaymentView(rec.order) };
 }
 
 /** After a timeout / 5xx the outcome is unknown: never resend, ask Get Status what happened. */
 async function directOutcomeUnknown(order, err) {
   if (!(err.statusCode >= 500)) throw err;
   const rec = await reconcile(order);
-  if (rec.order.paymentStatus === 'PAID') return { status: 'PAID', order: orderPaymentView(rec.order) };
+  if (isSettled(rec.order)) return settledView(rec.order);
   return { status: 'PENDING', message: 'We could not confirm the payment yet. Please wait a moment and check again before retrying.' };
 }
 
 /**
- * Pays an order with card details through the Direct API.
+ * Pays an order with card details through the Direct API (or only authorizes it, see SYNRAPAY_DIRECT_CAPTURE).
  * The card ({ number, expiry_month, expiry_year, cvv, name }) is passed straight to SynraPay and is
  * never stored or logged - only the last 4 digits are kept on the Payment.
  * A Direct order can be paid only once, so a retry after a decline gets a fresh attempt automatically.
  */
 async function payDirect(order, card) {
   if (!config.synrapay.directEnabled) throw new ApiError(400, 'UNSUPPORTED_PAYMENT_METHOD', 'This payment method is not available');
-  if (order.paymentStatus === 'PAID' || order.orderStatus !== 'PENDING') {
-    throw new ApiError(409, 'ORDER_NOT_PAYABLE', order.paymentStatus === 'PAID' ? 'This order is already paid' : 'This order can no longer be paid');
-  }
+  assertPayable(order);
   let payment = await latestPayment(order);
   const reusable = payment && payment.method === 'DIRECT_CARD' && payment.status === 'PENDING' && !payment.direct?.attempted && payment.direct?.orderId;
   if (!reusable) {
     if (payment?.method === 'DIRECT_CARD' && payment.status === 'PENDING' && payment.direct?.attempted) {
       // A card was already submitted on this attempt (e.g. 3-D Secure left open): make sure it didn't go through.
       const rec = await reconcile(order);
-      if (rec.order.paymentStatus === 'PAID') return { status: 'PAID', order: orderPaymentView(rec.order) };
+      if (isSettled(rec.order)) return settledView(rec.order);
     }
     await startPayment(order, 'DIRECT_CARD');
     payment = await latestPayment(order);
@@ -532,7 +635,7 @@ async function payDirect(order, card) {
     res = await synrapay.direct.pay({
       order_id: payment.direct.orderId,
       card: { number: card.number, expiry_month: card.expiry_month, expiry_year: card.expiry_year, cvv: card.cvv, ...(card.name && { name: card.name }) },
-      capture: true,
+      capture: !config.synrapay.directManualCapture, // false: authorize only, captured or voided by an admin
       // No return_url: SynraPay's default return page posts { type: 'synrapay-3ds-return' } to our page.
     });
   } catch (err) {
@@ -547,7 +650,7 @@ async function completeDirect(order) {
   if (!payment || payment.method !== 'DIRECT_CARD' || !payment.direct?.orderId || !payment.direct.attempted) {
     throw new ApiError(409, 'NO_PENDING_CHALLENGE', 'There is no card verification to complete for this order');
   }
-  if (order.paymentStatus === 'PAID') return { status: 'PAID', order: orderPaymentView(order) };
+  if (isSettled(order)) return settledView(order);
   let res;
   try {
     res = await synrapay.direct.authenticate(payment.direct.orderId);
@@ -555,7 +658,7 @@ async function completeDirect(order) {
     if (err.statusCode === 409 || err.statusCode === 400) {
       // Called too early, or the order is already final: Get Status has the truth.
       const rec = await reconcile(order);
-      if (rec.order.paymentStatus === 'PAID') return { status: 'PAID', order: orderPaymentView(rec.order) };
+      if (isSettled(rec.order)) return settledView(rec.order);
       if (rec.payment?.status === 'FAILED') return { status: 'DECLINED', code: 'PAYMENT_FAILED', message: DIRECT_DECLINE_COPY.PAYMENT_FAILED };
       return { status: 'REQUIRES_ACTION', message: 'Card verification is not finished yet. Complete it in the window above.' };
     }
@@ -564,11 +667,49 @@ async function completeDirect(order) {
   return settleDirect(order, payment, res);
 }
 
+/**
+ * Captures (takes) or voids (releases) the amount a Direct API authorization holds. Admin only.
+ * Capture is always for the full amount and is what makes the order PAID; a void leaves the order
+ * PENDING with a failed payment, like a decline, so it can be paid again or cancelled.
+ * @param {'capture'|'void'} operation
+ * @returns {{ payment, order }}
+ */
+async function settleAuthorization(paymentId, operation, { reason } = {}) {
+  const payment = await Payment.findOne({ _id: paymentId, provider: PROVIDER });
+  if (!payment) throw ApiError.notFound('Payment');
+  if (payment.method !== 'DIRECT_CARD' || !payment.direct?.orderId || payment.status !== 'AUTHORIZED') {
+    throw new ApiError(409, 'PAYMENT_NOT_AUTHORIZED', 'Only an authorized Direct API payment can be captured or voided');
+  }
+  const capture = operation === 'capture';
+  const to = capture ? 'PAID' : 'FAILED';
+  let res;
+  try {
+    res = capture ? await synrapay.direct.capture(payment.direct.orderId) : await synrapay.direct.void(payment.direct.orderId, reason);
+  } catch (err) {
+    // Refused (already captured, already voided, nothing held) or outcome unknown (timeout / 5xx):
+    // never resend - Get Status says what the payment is now.
+    const rec = await reconcilePayment(payment);
+    if (rec.payment.status === to) return { payment: rec.payment, order: rec.order || await Order.findById(payment.orderId) };
+    if (err.statusCode >= 500) {
+      throw new ApiError(502, 'PAYMENT_OUTCOME_UNKNOWN', `We could not confirm the ${operation} with SynraPay. Reload the order in a moment before trying again.`);
+    }
+    throw err;
+  }
+  const r = await applyResult(payment.merchantOrderId, capture
+    ? { status: 'PAID', amount: res.captured_amount ?? res.amount, currency: res.currency, source: 'ADMIN', event: 'direct.captured' }
+    : { status: 'FAILED', source: 'ADMIN', event: 'direct.voided', reason: `Authorization voided${reason ? `: ${reason}` : ''}` });
+  if (r.payment?.status !== to) {
+    // e.g. a partial capture or an amount mismatch: recorded and flagged, never fulfilled automatically.
+    throw new ApiError(409, 'PAYMENT_NEEDS_REVIEW', `SynraPay accepted the ${operation}, but it could not be applied to the order (${r.ignored || 'unknown'}). Check the payment in SynraPay.`);
+  }
+  return { payment: r.payment, order: r.order };
+}
+
 async function latestPayment(order) {
   return Payment.findOne({ orderId: order._id, provider: PROVIDER }).sort({ createdAt: -1 });
 }
 
 module.exports = {
-  PROVIDER, SYNRAPAY_METHODS, newPayToken, findPayableOrder, startPayment, applyResult, resultFromWebhook,
-  reconcile, reconcilePayment, isOpen, latestPayment, paymentView, orderPaymentView, payDirect, completeDirect,
+  PROVIDER, SYNRAPAY_METHODS, newPayToken, findPayableOrder, startPayment, applyResult, resultFromWebhook, merchantOrderIdOf,
+  reconcile, reconcilePayment, isOpen, latestPayment, paymentView, orderPaymentView, payDirect, completeDirect, settleAuthorization,
 };

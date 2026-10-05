@@ -86,7 +86,7 @@ const webhook = asyncHandler(async (req, res) => {
   // Acknowledge so SynraPay doesn't retry; apply afterwards.
   res.sendStatus(200);
   const body = req.body || {};
-  const merchantOrderId = String(body.orderId || body.merchant_order_id || ''); // Direct API orders use merchant_order_id
+  const merchantOrderId = payments.merchantOrderIdOf(body);
   setImmediate(async () => {
     try {
       const result = payments.resultFromWebhook(body, req.webhookEvent);
@@ -94,9 +94,9 @@ const webhook = asyncHandler(async (req, res) => {
       if (r.ignored) console.log(`[webhook] ${merchantOrderId} ${req.webhookEvent || body.status}: ${r.ignored}`);
       else console.log(`[webhook] ${merchantOrderId} -> payment ${r.payment.status}, order ${r.order?.orderStatus}`);
       // Keep the link's own status in step when SynraPay reports it.
-      if (body.paymentLinkId && body.linkStatus) {
-        await Payment.updateOne({ 'link.paymentLinkId': body.paymentLinkId }, { 'link.status': body.linkStatus });
-      }
+      const linkId = body.paymentLinkId || body.paymentLink?.paymentLinkId;
+      const linkStatus = body.linkStatus || body.paymentLink?.status;
+      if (linkId && linkStatus) await Payment.updateOne({ 'link.paymentLinkId': linkId }, { 'link.status': linkStatus });
       await webhookLog.recordOutcome(logId, {
         processing: r.ignored ? 'IGNORED' : 'PROCESSED',
         outcome: r.ignored || `payment ${r.payment.status}, order ${r.order?.orderStatus || 'n/a'}`,

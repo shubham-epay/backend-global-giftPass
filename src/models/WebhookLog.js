@@ -3,18 +3,13 @@ const { ref } = require('./_shared');
 
 /**
  * Every webhook delivery we receive, accepted or rejected, exactly as it arrived - collection `webhook`.
- * A payment that completes without a webhook reaching us is recorded here too (see `source`), so every
- * finished payment has an entry.
+ * Only deliveries SynraPay sends to our webhook endpoint are stored here - nothing from Get Status or
+ * any other API call.
  * It is the audit trail for "what did the provider tell us, and what did we do with it".
  * Secrets are never stored: the API-key header and cookies/authorization are redacted.
  */
 const webhookLogSchema = new Schema({
   provider: { type: String, required: true, trim: true, maxlength: 40 },   // SYNRAPAY
-  // Where this record came from:
-  //  WEBHOOK    - a delivery SynraPay sent to our endpoint
-  //  GET_STATUS - written by us when Get Status reported a final result (webhook late, lost or unreachable)
-  //  DIRECT_API - written by us from the Direct API payment response
-  source: { type: String, enum: ['WEBHOOK', 'GET_STATUS', 'DIRECT_API'], default: 'WEBHOOK' },
   event: { type: String, trim: true, maxlength: 80 },                      // x-synrapay-event, e.g. payment.succeeded
   // SHA-256 of event + raw body. Provider retries resend the same body, so they share one document.
   deliveryId: { type: String, maxlength: 64 },
@@ -26,6 +21,9 @@ const webhookLogSchema = new Schema({
   verified: { type: Boolean, required: true },                             // signature + API key accepted
   rejectReason: { type: String, maxlength: 120 },                          // why it was refused (verified: false)
   signatureTimestamp: { type: String, maxlength: 40 },                     // x-synrapay-timestamp as sent
+  // When SynraPay signed the delivery. Deliveries can arrive out of order (an authorization after its
+  // capture), so sort by this - not createdAt - to read them in the order things happened.
+  sentAt: Date,
 
   // Request, as received
   requestId: { type: String, maxlength: 64 },
@@ -33,10 +31,11 @@ const webhookLogSchema = new Schema({
   userAgent: { type: String, maxlength: 300 },
   headers: { type: Schema.Types.Mixed },                                   // redacted copy
   payload: { type: Schema.Types.Mixed },                                   // parsed JSON body
-  rawBody: { type: String },                                               // exact bytes that were signed (capped)
+  rawBody: { type: Schema.Types.Mixed },                                   // signed body as an object (text if not JSON or over the cap)
 
   // What the delivery is about (copied out of the payload for searching)
   merchantOrderId: { type: String, trim: true, maxlength: 100 },           // our attempt id, e.g. GGP-261005-ABC123-P1
+  referenceId: { type: String, trim: true, maxlength: 100 },               // payment link deliveries: payload.paymentLink.referenceId
   orderNumber: { type: String, trim: true, uppercase: true, maxlength: 40 },
   transactionId: { type: String, trim: true, maxlength: 200 },
   paymentLinkId: { type: String, trim: true, maxlength: 100 },
@@ -64,10 +63,10 @@ const webhookLogSchema = new Schema({
 
 webhookLogSchema.index({ provider: 1, deliveryId: 1 }, { unique: true, partialFilterExpression: { verified: true, deliveryId: { $type: 'string' } } });
 webhookLogSchema.index({ merchantOrderId: 1, createdAt: -1 });
+webhookLogSchema.index({ sentAt: -1 });
 webhookLogSchema.index({ orderNumber: 1, createdAt: -1 });
 webhookLogSchema.index({ transactionId: 1 }, { sparse: true });
 webhookLogSchema.index({ processing: 1, createdAt: -1 });
-webhookLogSchema.index({ source: 1, createdAt: -1 });
 webhookLogSchema.index({ createdAt: -1 });
 
 module.exports = model('WebhookLog', webhookLogSchema, 'webhook');

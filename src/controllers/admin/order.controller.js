@@ -5,6 +5,7 @@ const asyncHandler = require('../../utils/asyncHandler');
 const { escapeRegex, isObjectId } = require('../../utils/helpers');
 const { runInTransaction } = require('../../utils/transaction');
 const { audit } = require('../../services/audit.service');
+const paymentService = require('../../services/payment.service');
 const { ORDER_TRANSITIONS, ORDER_STATUS, PAYMENT_STATUS } = require('../../constants/enums');
 
 const parseDate = (v) => {
@@ -104,4 +105,19 @@ const updateStatus = asyncHandler(async (req, res) => {
   res.json({ success: true, data: { order, cancelledVouchers } });
 });
 
-module.exports = { list, getOne, updateStatus };
+/** Captures or voids a Direct API authorization on this order (see payment.service settleAuthorization). */
+const settleAuthorization = (operation) => asyncHandler(async (req, res) => {
+  const owned = await Payment.exists({ _id: req.params.paymentId, orderId: req.params.id });
+  if (!owned) throw ApiError.notFound('Payment');
+  const { payment, order } = await paymentService.settleAuthorization(req.params.paymentId, operation, { reason: req.body?.reason });
+  audit(req, {
+    action: `orders.${operation}Payment`, resource: 'orders', resourceId: req.params.id,
+    summary: `Order ${order?.orderNumber || req.params.id}: ${operation === 'capture' ? 'captured' : 'voided'} ${payment.amount} ${payment.currency} authorization (${payment.merchantOrderId})`,
+    changes: { paymentStatus: { from: 'AUTHORIZED', to: payment.status }, ...(req.body?.reason && { reason: req.body.reason }) },
+  });
+  res.json({ success: true, data: { payment: { _id: payment._id, status: payment.status }, orderStatus: order?.orderStatus, paymentStatus: order?.paymentStatus } });
+});
+const capturePayment = settleAuthorization('capture');
+const voidPayment = settleAuthorization('void');
+
+module.exports = { list, getOne, updateStatus, capturePayment, voidPayment };

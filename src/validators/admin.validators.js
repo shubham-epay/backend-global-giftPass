@@ -142,6 +142,8 @@ const orderStatusUpdate = z.object({
   trackingNumber: optStr(120),
   notes: optStr(2000),
 });
+const orderPaymentParams = z.object({ id: objectId, paymentId: objectId });
+const paymentVoid = z.object({ reason: optStr(200) });
 
 const voucherCreate = z.object({
   orderId: objectId, recipientName: str(120), recipientEmail: email, senderName: str(120), expiryDate: date,
@@ -198,5 +200,5 @@ module.exports = {
   giftBox: withUpdate(giftBoxCreate), coupon: withUpdate(couponCreate),
   banner: withUpdate(bannerCreate), collection: withUpdate(collectionCreate),
   blog: withUpdate(blogCreate), faq: withUpdate(faqCreate),
-  productImportQuery, productBulk, orderStatusUpdate, voucherCreate, voucherUpdate, voucherStatusUpdate,
+  productImportQuery, productBulk, orderStatusUpdate, orderPaymentParams, paymentVoid, voucherCreate, voucherUpdate, voucherStatusUpdate,
 };

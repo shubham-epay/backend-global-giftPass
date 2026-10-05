@@ -25,6 +25,7 @@ const PERMISSION_GROUPS = [
   { group: 'Orders', permissions: [
     { key: 'orders.read', label: 'View orders' },
     { key: 'orders.updateStatus', label: 'Change order status' },
+    { key: 'orders.managePayments', label: 'Capture or void card authorizations' },
   ] },
   { group: 'Vouchers', permissions: [
     { key: 'vouchers.read', label: 'View vouchers' },

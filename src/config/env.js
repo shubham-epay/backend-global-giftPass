@@ -44,6 +44,9 @@ const schema = z.object({
   // Direct API (our own card form). Needs SynraPay to enable it on the account, and PCI DSS attestation
   // in production. Set to false to hide the method.
   SYNRAPAY_DIRECT_API: bool(true),
+  // Direct API: `auto` takes the money in the payment call; `manual` only holds it (authorization)
+  // until an admin captures or voids it on the order.
+  SYNRAPAY_DIRECT_CAPTURE: z.enum(['auto', 'manual']).default('auto'),
   PAYMENT_LINK_EXPIRES_HOURS: z.coerce.number().int().min(24).max(720).default(24),
   // Public storefront URL: SynraPay sends shoppers back here after paying (standard links, hosted checkout).
   STOREFRONT_URL: z.string().url().optional(),
@@ -76,6 +79,7 @@ const config = Object.freeze({
     enabled: Boolean(env.SYNRAPAY_MERCHANT_ID && env.SYNRAPAY_SIGNATURE_KEY),
     environment: synraSandbox ? 'sandbox' : 'production',
     directEnabled: env.SYNRAPAY_DIRECT_API,
+    directManualCapture: env.SYNRAPAY_DIRECT_CAPTURE === 'manual',
     // 3-D Secure completion paths (action.complete_url) already start with /v1: join them to the host only.
     apiOrigin: new URL(env.SYNRAPAY_BASE).origin,
     hostedSessionScript: env.SYNRAPAY_HOSTED_SESSION_JS
