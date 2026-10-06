@@ -188,7 +188,7 @@ const checkout = asyncHandler(async (req, res) => {
   if (payments.SYNRAPAY_METHODS.includes(b.paymentMethod)) {
     try {
       payment = await payments.startPayment(result.order, b.paymentMethod, {
-        linkType: b.paymentLinkType, expiresInHours: b.paymentLinkExpiresInHours, origin: req.get('origin'),
+        linkType: b.paymentLinkType, expiresInHours: b.paymentLinkExpiresInHours, captureMode: b.directCaptureMode, origin: req.get('origin'),
       });
     } catch (err) {
       paymentError = { code: err.code || 'PAYMENT_START_FAILED', message: err.isOperational ? err.message : 'The payment could not be started' };

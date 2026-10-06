@@ -17,6 +17,8 @@ const synrapay = require('./synrapay.service');
  */
 
 const PROVIDER = 'SYNRAPAY';
+// Direct API attempts that don't say how to capture follow SYNRAPAY_DIRECT_CAPTURE.
+const DEFAULT_CAPTURE_MODE = config.synrapay.directManualCapture ? 'AUTHORIZE' : 'CAPTURE';
 const SYNRAPAY_METHODS = ['CARD', 'HOSTED_SESSION', 'PAY_BY_LINK', ...(config.synrapay.directEnabled ? ['DIRECT_CARD'] : [])];
 
 // ---------------- pay token (guest access to one order's payment) ----------------
@@ -137,7 +139,9 @@ function paymentView(p, { withClientToken } = {}) {
       link: { kind: p.link?.kind, url: p.link?.url, status: p.link?.status, expiresAt: p.link?.expiresAt },
     }),
     ...(p.method === 'CARD' && { checkoutUrl: p.checkoutUrl }),
-    ...(p.method === 'DIRECT_CARD' && { direct: { challenge: Boolean(p.direct?.challenge), environment: config.synrapay.environment } }),
+    ...(p.method === 'DIRECT_CARD' && {
+      direct: { challenge: Boolean(p.direct?.challenge), captureMode: p.direct?.captureMode || DEFAULT_CAPTURE_MODE, environment: config.synrapay.environment },
+    }),
     createdAt: p.createdAt,
   };
 }
@@ -186,7 +190,7 @@ async function retirePreviousLinks(order) {
 /**
  * Starts a SynraPay payment for a PENDING order.
  * @param {'CARD'|'HOSTED_SESSION'|'PAY_BY_LINK'} method
- * @param {{ linkType?: 'STANDARD'|'QUICK', expiresInHours?: number }} opts
+ * @param {{ linkType?: 'STANDARD'|'QUICK', expiresInHours?: number, captureMode?: 'AUTHORIZE'|'CAPTURE' }} opts
  * @returns the attempt view (HOSTED_SESSION includes the short-lived clientToken)
  */
 async function startPayment(order, method, opts = {}) {
@@ -254,7 +258,7 @@ async function startPayment(order, method, opts = {}) {
       ...(order.userId && { customer_id: String(order.userId) }),
       customer: { name: order.customer?.name, email: order.customer?.email, phone: order.customer?.phone },
     });
-    fields.direct = { orderId: data.order_id };
+    fields.direct = { orderId: data.order_id, captureMode: opts.captureMode || DEFAULT_CAPTURE_MODE };
     data.transactionId = data.order_id;
   } else {
     data = await synrapay.payments.createOrder(body);
@@ -607,7 +611,8 @@ async function directOutcomeUnknown(order, err) {
 }
 
 /**
- * Pays an order with card details through the Direct API (or only authorizes it, see SYNRAPAY_DIRECT_CAPTURE).
+ * Pays an order with card details through the Direct API, or only authorizes it when the attempt's
+ * captureMode is AUTHORIZE (chosen at checkout; SYNRAPAY_DIRECT_CAPTURE is the default).
  * The card ({ number, expiry_month, expiry_year, cvv, name }) is passed straight to SynraPay and is
  * never stored or logged - only the last 4 digits are kept on the Payment.
  * A Direct order can be paid only once, so a retry after a decline gets a fresh attempt automatically.
@@ -623,7 +628,8 @@ async function payDirect(order, card) {
       const rec = await reconcile(order);
       if (isSettled(rec.order)) return settledView(rec.order);
     }
-    await startPayment(order, 'DIRECT_CARD');
+    // A retry keeps the way the shopper chose to pay (authorize only, or capture at once).
+    await startPayment(order, 'DIRECT_CARD', { captureMode: payment?.method === 'DIRECT_CARD' ? payment.direct?.captureMode : undefined });
     payment = await latestPayment(order);
   }
   // Mark before calling: if we crash mid-call this order is never charged a second time.
@@ -635,7 +641,8 @@ async function payDirect(order, card) {
     res = await synrapay.direct.pay({
       order_id: payment.direct.orderId,
       card: { number: card.number, expiry_month: card.expiry_month, expiry_year: card.expiry_year, cvv: card.cvv, ...(card.name && { name: card.name }) },
-      capture: !config.synrapay.directManualCapture, // false: authorize only, captured or voided by an admin
+      // false: authorize only - the amount is held until an admin captures or voids it.
+      capture: (payment.direct.captureMode || DEFAULT_CAPTURE_MODE) !== 'AUTHORIZE',
       // No return_url: SynraPay's default return page posts { type: 'synrapay-3ds-return' } to our page.
     });
   } catch (err) {
@@ -710,6 +717,6 @@ async function latestPayment(order) {
 }
 
 module.exports = {
-  PROVIDER, SYNRAPAY_METHODS, newPayToken, findPayableOrder, startPayment, applyResult, resultFromWebhook, merchantOrderIdOf,
+  PROVIDER, DEFAULT_CAPTURE_MODE, SYNRAPAY_METHODS, newPayToken, findPayableOrder, startPayment, applyResult, resultFromWebhook, merchantOrderIdOf,
   reconcile, reconcilePayment, isOpen, latestPayment, paymentView, orderPaymentView, payDirect, completeDirect, settleAuthorization,
 };

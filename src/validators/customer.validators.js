@@ -124,6 +124,7 @@ const checkout = z.object({
   saveInfo: z.boolean().optional().default(false),
   paymentMethod: z.enum(E.PAYMENT_METHODS).default('CARD'),
   paymentLinkType: z.enum(E.PAYMENT_LINK_TYPES).optional(),
+  directCaptureMode: z.enum(E.DIRECT_CAPTURE_MODES).optional(),
   paymentLinkExpiresInHours: z.number().int().min(24).max(720).optional(),
   billingSameAsShipping: z.boolean().optional().default(true),
   billing: z.object(addressFields).optional(),
@@ -146,6 +147,7 @@ const orderNumberParams = z.object({
 const paymentStart = z.object({
   method: z.enum(['CARD', 'HOSTED_SESSION', 'PAY_BY_LINK', 'DIRECT_CARD']),
   linkType: z.enum(E.PAYMENT_LINK_TYPES).optional(),
+  captureMode: z.enum(E.DIRECT_CAPTURE_MODES).optional(),
   expiresInHours: z.number().int().min(24).max(720).optional(),
 }).strict();
 /** Luhn checksum: catches mistyped card numbers before they reach the payment provider. */

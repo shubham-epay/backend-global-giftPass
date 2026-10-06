@@ -1,5 +1,5 @@
 const { Schema, model } = require('mongoose');
-const { PAYMENT_STATUS, PAYMENT_LINK_TYPES } = require('../constants/enums');
+const { PAYMENT_STATUS, PAYMENT_LINK_TYPES, DIRECT_CAPTURE_MODES } = require('../constants/enums');
 const { money, ref } = require('./_shared');
 
 const paymentEventSchema = new Schema({
@@ -41,6 +41,7 @@ const paymentSchema = new Schema({
   // Direct API attempt. Only SynraPay's order id and progress flags - never the card number or CVV.
   direct: {
     orderId: { type: String, maxlength: 64 },   // SynraPay order_id (UUID) from /direct/create-order
+    captureMode: { type: String, enum: DIRECT_CAPTURE_MODES }, // AUTHORIZE: held until an admin captures; CAPTURE: taken at once
     attempted: { type: Boolean, default: false }, // a card was submitted (an order can be paid only once)
     challenge: { type: Boolean, default: false }, // waiting for the shopper to finish 3-D Secure
   },

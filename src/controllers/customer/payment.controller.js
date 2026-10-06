@@ -19,6 +19,7 @@ const paymentConfig = (_req, res) => {
       environment: config.synrapay.environment,
       methods: enabled ? payments.SYNRAPAY_METHODS : [],
       linkTypes: ['STANDARD', 'QUICK'],
+      directCapture: { modes: ['AUTHORIZE', 'CAPTURE'], default: payments.DEFAULT_CAPTURE_MODE },
       linkExpiry: { defaultHours: config.PAYMENT_LINK_EXPIRES_HOURS, minHours: 24, maxHours: 720 },
     },
   });
@@ -35,7 +36,7 @@ const paymentStatus = asyncHandler(async (req, res) => {
 const startPayment = asyncHandler(async (req, res) => {
   const order = await payments.findPayableOrder(req.params.orderNumber, { user: req.user, token: tokenOf(req) });
   const payment = await payments.startPayment(order, req.body.method, {
-    linkType: req.body.linkType, expiresInHours: req.body.expiresInHours, origin: req.get('origin'),
+    linkType: req.body.linkType, expiresInHours: req.body.expiresInHours, captureMode: req.body.captureMode, origin: req.get('origin'),
   });
   res.status(201).json({ success: true, data: { order: payments.orderPaymentView(order), payment } });
 });
