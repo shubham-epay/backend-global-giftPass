@@ -65,13 +65,17 @@ router.post('/checkout', cartOwner, sensitiveLimiter, validate({ body: v.checkou
 
 // Payments (SynraPay) - guests prove access with the X-Payment-Token from checkout, signed-in owners by session.
 router.get('/payments/config', pay.paymentConfig);
-router.post('/payments/synrapay/webhook', verifySynrapayWebhook, pay.webhook);
+// Shared webhook URL (either environment). Each environment's own URL (SYNRAPAY_<ENV>_WEBHOOK_URL) is mounted in app.js.
+router.post('/payments/synrapay/webhook', verifySynrapayWebhook(), pay.webhook);
 router.get('/payments/:orderNumber', cartOwner, validate({ params: v.orderNumberParams }), pay.paymentStatus);
 router.post('/payments/:orderNumber/start', cartOwner, sensitiveLimiter, validate({ params: v.orderNumberParams, body: v.paymentStart }), pay.startPayment);
 router.post('/payments/:orderNumber/send-link', cartOwner, sensitiveLimiter, validate({ params: v.orderNumberParams, body: v.paymentSendLink }), pay.sendLink);
 // Direct API: card details from our own form. HTTPS only in production; bodies are never logged.
 router.post('/payments/:orderNumber/direct/pay', cartOwner, sensitiveLimiter, validate({ params: v.orderNumberParams, body: v.paymentDirectPay }), pay.directPay);
+router.get('/payments/:orderNumber/saved-cards', cartOwner, validate({ params: v.orderNumberParams }), pay.savedCards);
 router.post('/payments/:orderNumber/direct/authenticate', cartOwner, sensitiveLimiter, validate({ params: v.orderNumberParams, body: v.paymentDirectAuthenticate }), pay.directAuthenticate);
+// Saved cards (SynraPay tokenization): only the signed-in customer's own.
+router.delete('/payment-methods/:paymentMethodId', ...personal, sensitiveLimiter, validate({ params: v.paymentMethodParams, query: v.paymentMethodQuery }), pay.removeSavedCard);
 
 // Orders
 router.get('/orders', ...personal, validate({ query: v.orderListQuery }), orders.listOrders);

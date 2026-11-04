@@ -13,6 +13,12 @@ const { apiLimiter } = require('./middlewares/rateLimiters');
 const { notFound, errorHandler } = require('./middlewares/errorHandler');
 const ApiError = require('./utils/ApiError');
 const routes = require('./routes');
+const verifySynrapayWebhook = require('./middlewares/synrapayWebhook');
+const pay = require('./controllers/customer/payment.controller');
+
+// SynraPay webhook paths: the shared one, and each environment's own (from SYNRAPAY_<ENV>_WEBHOOK_URL).
+const webhookEnvs = Object.values(config.synrapay.environments);
+const WEBHOOK_PATHS = new Set([config.synrapay.sharedWebhookPath, ...webhookEnvs.map((e) => e.webhookPath)]);
 
 const app = express();
 
@@ -40,7 +46,7 @@ app.use(express.json({
   limit: '1mb',
   // The payment webhook is signed over the exact bytes received, so keep them - for that route only
   // (other payment routes can carry card details, which must not be kept around).
-  verify: (req, _res, buf) => { if (req.originalUrl.split('?')[0] === '/api/payments/synrapay/webhook') req.rawBody = buf.toString('utf8'); },
+  verify: (req, _res, buf) => { if (WEBHOOK_PATHS.has(req.originalUrl.split('?')[0])) req.rawBody = buf.toString('utf8'); },
 }));
 app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 app.use(cookieParser());
@@ -54,6 +60,10 @@ app.use(morgan(config.isProd
 
 // Admin responses must never be cached by browsers or proxies.
 app.use('/api/admin', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+// One webhook URL per SynraPay environment, verified only with that environment's api key and secrets.
+// Mounted at the app root so the path can be anything SYNRAPAY_<ENV>_WEBHOOK_URL names (e.g. /webhook).
+for (const e of webhookEnvs) app.post(e.webhookPath, apiLimiter, verifySynrapayWebhook(e.id), pay.webhook);
+
 app.use('/api', apiLimiter, routes);
 
 app.use(notFound);

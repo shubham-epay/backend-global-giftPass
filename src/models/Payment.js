@@ -1,5 +1,5 @@
 const { Schema, model } = require('mongoose');
-const { PAYMENT_STATUS, PAYMENT_LINK_TYPES, DIRECT_CAPTURE_MODES } = require('../constants/enums');
+const { PAYMENT_STATUS, PAYMENT_LINK_TYPES, DIRECT_CAPTURE_MODES, PAYMENT_ENVIRONMENTS } = require('../constants/enums');
 const { money, ref } = require('./_shared');
 
 const paymentEventSchema = new Schema({
@@ -13,6 +13,9 @@ const paymentEventSchema = new Schema({
 const paymentSchema = new Schema({
   orderId: ref('Order', { required: true }),
   provider: { type: String, required: true, trim: true, maxlength: 40 },   // e.g. SYNRAPAY, EPAYME, GEIDEA
+  // SynraPay environment (merchant account) the attempt was created in; every later call for it goes there.
+  // Attempts made before there were two environments have none and are `dev`.
+  environment: { type: String, enum: PAYMENT_ENVIRONMENTS },
   // The orderId sent to the provider for this attempt (order number + attempt, e.g. GGP-261003-ABC123-P1).
   merchantOrderId: { type: String, trim: true, maxlength: 100 },
   providerReference: { type: String, trim: true, maxlength: 200 },          // PSP transaction / intent id
@@ -29,6 +32,8 @@ const paymentSchema = new Schema({
     sessionId: { type: String, maxlength: 200 },
     expiresAt: Date,
     fallbackCheckoutUrl: { type: String, maxlength: 2048 },
+    // The SDK SynraPay names in the Create Session response: a client token only works with its own SDK.
+    sdkUrl: { type: String, maxlength: 2048 },
   },
   link: {
     kind: { type: String, enum: PAYMENT_LINK_TYPES },
@@ -44,6 +49,7 @@ const paymentSchema = new Schema({
     captureMode: { type: String, enum: DIRECT_CAPTURE_MODES }, // AUTHORIZE: held until an admin captures; CAPTURE: taken at once
     attempted: { type: Boolean, default: false }, // a card was submitted (an order can be paid only once)
     challenge: { type: Boolean, default: false }, // waiting for the shopper to finish 3-D Secure
+    refundLockAt: Date,                           // a refund call is in flight (one at a time per payment)
   },
   // Get Status polling (paymentReconciler): last raw provider status and when we last asked.
   providerStatus: { type: String, maxlength: 40 },

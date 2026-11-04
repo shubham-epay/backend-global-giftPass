@@ -144,6 +144,12 @@ const orderStatusUpdate = z.object({
 });
 const orderPaymentParams = z.object({ id: objectId, paymentId: objectId });
 const paymentVoid = z.object({ reason: optStr(200) });
+// No amount: refund everything still refundable.
+const paymentRefund = z.object({
+  amount: z.number().positive().max(10_000_000)
+    .refine((v) => Math.abs(v * 100 - Math.round(v * 100)) < 1e-6, 'Use at most 2 decimal places').optional(),
+  reason: optStr(200),
+}).strict();
 
 const voucherCreate = z.object({
   orderId: objectId, recipientName: str(120), recipientEmail: email, senderName: str(120), expiryDate: date,
@@ -200,5 +206,5 @@ module.exports = {
   giftBox: withUpdate(giftBoxCreate), coupon: withUpdate(couponCreate),
   banner: withUpdate(bannerCreate), collection: withUpdate(collectionCreate),
   blog: withUpdate(blogCreate), faq: withUpdate(faqCreate),
-  productImportQuery, productBulk, orderStatusUpdate, orderPaymentParams, paymentVoid, voucherCreate, voucherUpdate, voucherStatusUpdate,
+  productImportQuery, productBulk, orderStatusUpdate, orderPaymentParams, paymentVoid, paymentRefund, voucherCreate, voucherUpdate, voucherStatusUpdate,
 };

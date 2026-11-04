@@ -123,6 +123,7 @@ const checkout = z.object({
   phone: z.string().trim().min(4, 'Enter a phone number').max(30),
   saveInfo: z.boolean().optional().default(false),
   paymentMethod: z.enum(E.PAYMENT_METHODS).default('CARD'),
+  paymentEnvironment: z.enum(E.PAYMENT_ENVIRONMENTS).optional(), // SynraPay sandbox | dev; the configured default when omitted
   paymentLinkType: z.enum(E.PAYMENT_LINK_TYPES).optional(),
   directCaptureMode: z.enum(E.DIRECT_CAPTURE_MODES).optional(),
   paymentLinkExpiresInHours: z.number().int().min(24).max(720).optional(),
@@ -146,6 +147,7 @@ const orderNumberParams = z.object({
 });
 const paymentStart = z.object({
   method: z.enum(['CARD', 'HOSTED_SESSION', 'PAY_BY_LINK', 'DIRECT_CARD']),
+  environment: z.enum(E.PAYMENT_ENVIRONMENTS).optional(),
   linkType: z.enum(E.PAYMENT_LINK_TYPES).optional(),
   captureMode: z.enum(E.DIRECT_CAPTURE_MODES).optional(),
   expiresInHours: z.number().int().min(24).max(720).optional(),
@@ -178,7 +180,31 @@ const directCard = z.object({
     ctx.addIssue({ code: 'custom', path: ['expiry_month'], message: 'This card has expired' });
   }
 });
-const paymentDirectPay = z.object({ card: directCard }).strict();
+// A saved card's payment_method_id (PM_...): an opaque reference, never card data.
+const paymentMethodId = z.string().trim().min(1).max(100);
+const browserDetails = z.object({
+  acceptHeaders: z.string().trim().min(1).max(4096),
+  colorDepth: z.number().int().min(1).max(48),
+  javaEnabled: z.boolean(),
+  language: z.string().trim().min(1).max(35),
+  screenHeight: z.number().int().min(1).max(10000),
+  screenWidth: z.number().int().min(1).max(10000),
+  timeZone: z.number().int().min(-840).max(840),
+}).strict();
+/** Exactly one of `card` (typed in) or `paymentMethodId` (saved card). saveCard: the shopper agreed to keep the typed card. */
+const paymentDirectPay = z.object({
+  card: directCard.optional(),
+  paymentMethodId: paymentMethodId.optional(),
+  saveCard: z.boolean().optional(),
+  browser_details: browserDetails,
+}).strict().superRefine((d, ctx) => {
+  if (Boolean(d.card) === Boolean(d.paymentMethodId)) {
+    ctx.addIssue({ code: 'custom', path: [d.card ? 'paymentMethodId' : 'card'], message: 'Send either card details or a saved card, not both' });
+  }
+});
+const paymentMethodParams = z.object({ paymentMethodId });
+// The environment the saved card is in (each SynraPay account keeps its own cards).
+const paymentMethodQuery = z.object({ environment: z.enum(E.PAYMENT_ENVIRONMENTS).optional() });
 const paymentDirectAuthenticate = z.object({}).strict();
 
 const paymentSendLink = z.object({ email: checkoutEmail.optional() }).strict();
@@ -199,5 +225,5 @@ module.exports = {
   register, login, changePassword, profileUpdate, address, addressUpdate,
   productListQuery, searchQuery, slugParams, limitQuery, bannerQuery, countryQuery,
   cartAdd, cartUpdate, itemIdParams, wishlistAdd, productIdParams,
-  applyCoupon, checkout, orderListQuery, voucherListQuery, orderNumberParams, paymentStart, paymentSendLink, paymentDirectPay, paymentDirectAuthenticate,
+  applyCoupon, checkout, orderListQuery, voucherListQuery, orderNumberParams, paymentStart, paymentSendLink, paymentDirectPay, paymentDirectAuthenticate, paymentMethodParams, paymentMethodQuery,
 };

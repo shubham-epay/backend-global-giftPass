@@ -4,6 +4,31 @@ const { z } = require('zod');
 const bool = (def) =>
   z.enum(['true', 'false', '']).optional().transform((v) => (v === undefined || v === '' ? def : v === 'true'));
 
+const optional = z.string().optional().transform((v) => v || undefined);
+
+/** Settings of one SynraPay environment: SYNRAPAY_<NAME>_* (e.g. SYNRAPAY_SANDBOX_MERCHANT_ID). */
+const envVars = (name) => ({
+  [`SYNRAPAY_${name}_BASE`]: z.string().url().optional(),
+  [`SYNRAPAY_${name}_MERCHANT_ID`]: optional,
+  [`SYNRAPAY_${name}_SIGNATURE_KEY`]: optional,
+  [`SYNRAPAY_${name}_WEBHOOK_KEY_NAME`]: optional,
+  [`SYNRAPAY_${name}_WEBHOOK_KEY_VALUE`]: optional,
+  [`SYNRAPAY_${name}_WEBHOOK_SECRET`]: optional,
+  [`SYNRAPAY_${name}_WEBHOOK_SECRET_SECONDARY`]: optional, // during secret rotation
+  // Public URL registered in this environment's dashboard; the API serves its path for this environment only.
+  [`SYNRAPAY_${name}_WEBHOOK_URL`]: z.string().url().optional(),
+  [`SYNRAPAY_${name}_HOSTED_SESSION_JS`]: z.string().url().optional(),
+});
+
+// Older single webhook URL: accepts deliveries from either environment (whichever's secret verifies them).
+const SHARED_WEBHOOK_PATH = '/api/payments/synrapay/webhook';
+
+// Per environment: API base, label, and the Hosted Session SDK used when SynraPay doesn't name one.
+const SYNRAPAY_ENVIRONMENTS = {
+  sandbox: { label: 'Sandbox', base: 'https://sandbox-api.synrapay.com/v1', sdk: 'https://sandbox.js.synrapay.com/direct/v1/sdk.js' },
+  dev: { label: 'Dev', base: 'https://dev-api.synrapay.com/v1', sdk: 'https://dev.js.synrapay.com/direct/v1/sdk.js' },
+};
+
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().int().positive().default(5000),
@@ -32,21 +57,29 @@ const schema = z.object({
   LOGIN_LOCK_MINUTES: z.coerce.number().int().positive().default(15),
 
   // ---------- SynraPay (payments) ----------
-  // Optional: without a merchant ID and signing key, orders are still placed but can't be paid online.
-  SYNRAPAY_BASE: z.string().url().default('https://sandbox-api.synrapay.com/v1'),
-  SYNRAPAY_MERCHANT_ID: z.string().optional().transform((v) => v || undefined),
-  SYNRAPAY_SIGNATURE_KEY: z.string().optional().transform((v) => v || undefined),
-  SYNRAPAY_WEBHOOK_KEY_NAME: z.string().default('x-synrapay-key'),
-  SYNRAPAY_WEBHOOK_KEY_VALUE: z.string().optional().transform((v) => v || undefined),
-  SYNRAPAY_WEBHOOK_SECRET: z.string().optional().transform((v) => v || undefined),
-  SYNRAPAY_WEBHOOK_SECRET_SECONDARY: z.string().optional().transform((v) => v || undefined), // during secret rotation
-  SYNRAPAY_HOSTED_SESSION_JS: z.string().url().optional(),
+  // Two SynraPay environments, each with its own merchant account: `sandbox` and `dev`. The storefront
+  // picks one per payment; an environment without a merchant ID and signing key is not offered.
+  // The unprefixed SYNRAPAY_* names are the older single-environment settings and still configure `dev`.
+  SYNRAPAY_DEFAULT_ENV: z.enum(['sandbox', 'dev']).default('dev'),
+  ...envVars('SANDBOX'),
+  ...envVars('DEV'),
+  SYNRAPAY_BASE: optional,
+  SYNRAPAY_MERCHANT_ID: optional,
+  SYNRAPAY_SIGNATURE_KEY: optional,
+  SYNRAPAY_WEBHOOK_KEY_NAME: optional,
+  SYNRAPAY_WEBHOOK_KEY_VALUE: optional,
+  SYNRAPAY_WEBHOOK_SECRET: optional,
+  SYNRAPAY_WEBHOOK_SECRET_SECONDARY: optional, // during secret rotation
+  SYNRAPAY_HOSTED_SESSION_JS: z.string().url().optional(), // dev only (legacy name)
   // Direct API (our own card form). Needs SynraPay to enable it on the account, and PCI DSS attestation
   // in production. Set to false to hide the method.
   SYNRAPAY_DIRECT_API: bool(true),
   // Direct API: `auto` takes the money in the payment call; `manual` only holds it (authorization)
   // until an admin captures or voids it on the order.
   SYNRAPAY_DIRECT_CAPTURE: z.enum(['auto', 'manual']).default('auto'),
+  // Tokenization (saved cards for signed-in customers on the Direct API card form). SynraPay enables it
+  // per account and environment; set to false to hide saved cards.
+  SYNRAPAY_TOKENIZATION: bool(true),
   PAYMENT_LINK_EXPIRES_HOURS: z.coerce.number().int().min(24).max(720).default(24),
   // Public storefront URL: SynraPay sends shoppers back here after paying (standard links, hosted checkout).
   STOREFRONT_URL: z.string().url().optional(),
@@ -66,9 +99,45 @@ if (!parsed.success) {
 const env = parsed.data;
 const isProd = env.NODE_ENV === 'production';
 
-const corsOrigins = env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
-const synraSandbox = env.SYNRAPAY_BASE.includes('sandbox');
+/** One SynraPay environment's settings; `dev` falls back to the unprefixed (legacy) SYNRAPAY_* names. */
+function synrapayEnvironment(id) {
+  const name = id.toUpperCase();
+  const pick = (key) => env[`SYNRAPAY_${name}_${key}`] ?? (id === 'dev' ? env[`SYNRAPAY_${key}`] : undefined);
+  const defaults = SYNRAPAY_ENVIRONMENTS[id];
+  const base = (pick('BASE') || defaults.base).replace(/\/+$/, '');
+  const hostedSessionScriptOverride = pick('HOSTED_SESSION_JS');
+  return Object.freeze({
+    id,
+    label: defaults.label,
+    enabled: Boolean(pick('MERCHANT_ID') && pick('SIGNATURE_KEY')),
+    base,
+    merchantId: pick('MERCHANT_ID'),
+    signatureKey: pick('SIGNATURE_KEY'),
+    // 3-D Secure completion paths (action.complete_url) already start with /v1: join them to the host only.
+    apiOrigin: new URL(base).origin,
+    webhookKeyName: (pick('WEBHOOK_KEY_NAME') || 'x-synrapay-key').toLowerCase(),
+    webhookKeyValue: pick('WEBHOOK_KEY_VALUE'),
+    webhookSecrets: [pick('WEBHOOK_SECRET'), pick('WEBHOOK_SECRET_SECONDARY')].filter(Boolean),
+    // This environment's own webhook: the URL to register in its dashboard, and the path we serve for it.
+    webhookUrl: env[`SYNRAPAY_${name}_WEBHOOK_URL`],
+    webhookPath: (env[`SYNRAPAY_${name}_WEBHOOK_URL`] ? new URL(env[`SYNRAPAY_${name}_WEBHOOK_URL`]).pathname : `${SHARED_WEBHOOK_PATH}/${id}`)
+      .replace(/\/+$/, '') || '/',
+    // Normally the Create Session response names the SDK; this is only the fallback (or a forced override).
+    hostedSessionScriptOverride,
+    hostedSessionScript: hostedSessionScriptOverride || defaults.sdk,
+  });
+}
+const environments = Object.freeze(Object.fromEntries(Object.keys(SYNRAPAY_ENVIRONMENTS).map((id) => [id, synrapayEnvironment(id)])));
+{
+  // Each environment's webhook path must be its own: a delivery is verified only with the secrets of its path's environment.
+  const paths = [SHARED_WEBHOOK_PATH, ...Object.values(environments).map((e) => e.webhookPath)];
+  if (new Set(paths).size !== paths.length) {
+    console.error(`[config] SYNRAPAY_<ENV>_WEBHOOK_URL paths must differ from each other and from ${SHARED_WEBHOOK_PATH}: ${paths.join(', ')}`);
+    process.exit(1);
+  }
+}
 
+const corsOrigins = env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
 const config = Object.freeze({
   ...env,
   isProd,
@@ -76,14 +145,16 @@ const config = Object.freeze({
   corsOrigins,
   STOREFRONT_URL: (env.STOREFRONT_URL || corsOrigins[corsOrigins.length - 1] || 'http://localhost:5174').replace(/\/+$/, ''),
   synrapay: Object.freeze({
-    enabled: Boolean(env.SYNRAPAY_MERCHANT_ID && env.SYNRAPAY_SIGNATURE_KEY),
-    environment: synraSandbox ? 'sandbox' : 'production',
+    environments,
+    // The first environment offered: SYNRAPAY_DEFAULT_ENV when it is configured, else any configured one.
+    defaultEnvironment: environments[env.SYNRAPAY_DEFAULT_ENV]?.enabled
+      ? env.SYNRAPAY_DEFAULT_ENV
+      : Object.keys(environments).find((k) => environments[k].enabled) || env.SYNRAPAY_DEFAULT_ENV,
+    enabled: Object.values(environments).some((e) => e.enabled),
+    sharedWebhookPath: SHARED_WEBHOOK_PATH,
     directEnabled: env.SYNRAPAY_DIRECT_API,
     directManualCapture: env.SYNRAPAY_DIRECT_CAPTURE === 'manual',
-    // 3-D Secure completion paths (action.complete_url) already start with /v1: join them to the host only.
-    apiOrigin: new URL(env.SYNRAPAY_BASE).origin,
-    hostedSessionScript: env.SYNRAPAY_HOSTED_SESSION_JS
-      || (synraSandbox ? 'https://sandbox.js.synrapay.com/hosted-session.js' : 'https://js.synrapay.com/hosted-session.js'),
+    tokenization: env.SYNRAPAY_DIRECT_API && env.SYNRAPAY_TOKENIZATION,
   }),
 });
 

@@ -90,6 +90,7 @@ router.get('/orders/:id', authorize('orders.read'), validate({ params: idParams 
 router.patch('/orders/:id/status', authorize('orders.updateStatus'), validate({ params: idParams, body: v.orderStatusUpdate }), orders.updateStatus);
 router.post('/orders/:id/payments/:paymentId/capture', authorize('orders.managePayments'), validate({ params: v.orderPaymentParams }), orders.capturePayment);
 router.post('/orders/:id/payments/:paymentId/void', authorize('orders.managePayments'), validate({ params: v.orderPaymentParams, body: v.paymentVoid }), orders.voidPayment);
+router.post('/orders/:id/payments/:paymentId/refund', authorize('orders.refundPayments'), validate({ params: v.orderPaymentParams, body: v.paymentRefund }), orders.refundPayment);
 
 // Vouchers
 router.get('/vouchers', authorize('vouchers.read'), validate({ query: listQuery }), vouchers.list);

@@ -45,6 +45,8 @@ async function tick() {
       merchantOrderId: { $type: 'string' },
       $or: [{ status: { $in: ['PENDING', 'AUTHORIZED'] } }, { status: 'FAILED', 'link.status': 'ACTIVE' }],
       createdAt: { $gte: new Date(now - 31 * 24 * HOUR) },
+      // Only environments that are configured (attempts without one are `dev`).
+      environment: { $in: [...payments.ENVIRONMENTS, ...(payments.ENVIRONMENTS.includes('dev') ? [null] : [])] },
     }).sort({ statusCheckedAt: 1, createdAt: -1 }).limit(200);
 
     const due = open.filter((p) => now < deadlineOf(p)
@@ -66,7 +68,7 @@ function start() {
   timer = setInterval(tick, TICK_MS);
   timer.unref(); // never keeps the process alive on shutdown
   setTimeout(tick, 2000).unref(); // catch up on anything that was paid while the API was down
-  console.log(`[payments] Get Status polling started (every ${TICK_MS / 1000}s)`);
+  console.log(`[payments] Get Status polling started (every ${TICK_MS / 1000}s, environments: ${payments.ENVIRONMENTS.join(', ')})`);
 }
 
 function stop() {

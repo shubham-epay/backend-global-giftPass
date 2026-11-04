@@ -6,7 +6,7 @@ const REJECTED_RAW_LIMIT = 8 * 1024; // unauthenticated senders get less room
 
 /** Headers as received, minus anything that is a credential. The signature is a MAC, not a secret, so it stays. */
 function safeHeaders(req) {
-  const secret = new Set(['authorization', 'cookie', 'proxy-authorization', String(config.SYNRAPAY_WEBHOOK_KEY_NAME || '').toLowerCase()]);
+  const secret = new Set(['authorization', 'cookie', 'proxy-authorization', ...Object.values(config.synrapay.environments).map((e) => e.webhookKeyName)]);
   return Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, secret.has(k.toLowerCase()) ? '[redacted]' : String(v).slice(0, 500)]));
 }
 
@@ -85,7 +85,7 @@ async function recordAccepted(req, provider = 'SYNRAPAY') {
       { provider, deliveryId: req.webhookDeliveryId, verified: true },
       {
         $setOnInsert: {
-          provider, deliveryId: req.webhookDeliveryId, verified: true, firstReceivedAt: now, processing: 'RECEIVED',
+          provider, deliveryId: req.webhookDeliveryId, verified: true, environment: req.synrapayEnvironment, firstReceivedAt: now, processing: 'RECEIVED',
           ...requestFields(req, RAW_LIMIT), payload: body, ...summarise(body),
         },
         $set: { lastReceivedAt: now },

@@ -120,4 +120,20 @@ const settleAuthorization = (operation) => asyncHandler(async (req, res) => {
 const capturePayment = settleAuthorization('capture');
 const voidPayment = settleAuthorization('void');
 
-module.exports = { list, getOne, updateStatus, capturePayment, voidPayment };
+/** Refunds a captured Direct API payment on this order, fully or in part (see payment.service refundPayment). */
+const refundPayment = asyncHandler(async (req, res) => {
+  const owned = await Payment.exists({ _id: req.params.paymentId, orderId: req.params.id });
+  if (!owned) throw ApiError.notFound('Payment');
+  const { payment, order, refunded, refundedTotal } = await paymentService.refundPayment(req.params.paymentId, { amount: req.body.amount, reason: req.body.reason });
+  audit(req, {
+    action: 'orders.refundPayment', resource: 'orders', resourceId: req.params.id,
+    summary: `Order ${order?.orderNumber || req.params.id}: refunded ${refunded.toFixed(2)} ${payment.currency} (${refundedTotal.toFixed(2)} of ${payment.amount} refunded, ${payment.merchantOrderId})`,
+    changes: { refunded, refundedTotal, paymentStatus: payment.status, ...(req.body.reason && { reason: req.body.reason }) },
+  });
+  res.json({
+    success: true,
+    data: { payment: { _id: payment._id, status: payment.status, refundedAmount: payment.refundedAmount }, refunded, orderStatus: order?.orderStatus, paymentStatus: order?.paymentStatus },
+  });
+});
+
+module.exports = { list, getOne, updateStatus, capturePayment, voidPayment, refundPayment };

@@ -7,22 +7,28 @@ const ApiError = require('../utils/ApiError');
  *   x-signature = HMAC_SHA512(`${x-timestamp}.${rawBody}`, api_signature_key), lowercase hex
  * with x-timestamp in milliseconds. A GET has no body and signs `${ts}.`.
  * Never call these from the browser: that would expose the signing key.
+ *
+ * There is one client per SynraPay environment (`sandbox`, `dev`), each signed with its own merchant
+ * account: `synrapay.env('sandbox').payments.createOrder(...)`. A payment is always continued in the
+ * environment it was created in.
  */
 
 // SynraPay codes that are safe and useful to show the shopper as-is.
 const PASS_THROUGH = new Set([
-  'VALIDATION_ERROR', 'DUPLICATE_ORDER_ID', 'ORDER_ALREADY_PAID', 'ORDER_NOT_PAYABLE', 'PAYMENT_IN_PROGRESS',
+  'VALIDATION_ERROR', 'DUPLICATE_ORDER_ID', 'ORDER_REJECTED_BY_RISK', 'ORDER_ALREADY_PAID', 'ORDER_NOT_PAYABLE', 'PAYMENT_IN_PROGRESS',
   'PAYMENT_LINK_NOT_FOUND', 'PAYMENT_LINK_NOT_EDITABLE', 'ORIGIN_NOT_REGISTERED', 'PAYMENT_BLOCKED', 'EMAIL_NOT_SENT',
   'PROVIDER_UNAVAILABLE', 'PROVIDER_UNSUPPORTED', 'SESSION_EXPIRED',
   // Direct API
   'INVALID_PAYMENT', 'UNSUPPORTED_CURRENCY', 'ORDER_NOT_FOUND', 'GATEWAY_TIMEOUT',
 ]);
 
-function sign(rawBody) {
+function sign(rawBody, key) {
   const ts = Date.now().toString();
-  const sig = crypto.createHmac('sha512', config.SYNRAPAY_SIGNATURE_KEY).update(`${ts}.${rawBody}`).digest('hex');
+  const sig = crypto.createHmac('sha512', key).update(`${ts}.${rawBody}`).digest('hex');
   return { ts, sig };
 }
+
+const unavailable = () => new ApiError(503, 'PAYMENTS_UNAVAILABLE', 'Online payment is not available right now');
 
 /**
  * Signed request. Resolves to the response body; throws ApiError (code SYNRAPAY_* or SynraPay's own).
@@ -30,18 +36,21 @@ function sign(rawBody) {
  * opts.absolute: `path` already includes /v1 (3-D Secure complete_url), so it is joined to the API host.
  * Request bodies are never logged: Direct API payments carry the card number and CVV.
  */
-async function request(method, path, body, opts = {}) {
-  if (!config.synrapay.enabled) throw new ApiError(503, 'PAYMENTS_UNAVAILABLE', 'Online payment is not available right now');
+async function request(cfg, method, path, body, opts = {}) {
+  if (!cfg.enabled) throw unavailable();
   const rawBody = body === undefined ? '' : JSON.stringify(body);
-  const { ts, sig } = sign(rawBody);
+  const { ts, sig } = sign(rawBody, cfg.signatureKey);
 
   let res;
+  const requestUrl = `${opts.absolute ? cfg.apiOrigin : cfg.base}${path}`;
+  const route = new URL(requestUrl);
+  console.log(`[synrapay:${cfg.id}] ${method} ${route.origin}${route.pathname}`);
   try {
-    res = await fetch(`${opts.absolute ? config.synrapay.apiOrigin : config.SYNRAPAY_BASE}${path}`, {
+    res = await fetch(requestUrl, {
       method,
       headers: {
         ...(rawBody && { 'content-type': 'application/json' }),
-        'x-merchant-id': config.SYNRAPAY_MERCHANT_ID,
+        'x-merchant-id': cfg.merchantId,
         'x-timestamp': ts,
         'x-signature': sig,
       },
@@ -49,7 +58,7 @@ async function request(method, path, body, opts = {}) {
       signal: AbortSignal.timeout(opts.timeoutMs || 20000),
     });
   } catch (err) {
-    console.error(`[synrapay] ${method} ${path} unreachable:`, err.message);
+    console.error(`[synrapay:${cfg.id}] ${method} ${path} unreachable:`, err.message);
     throw new ApiError(502, 'PAYMENT_PROVIDER_UNAVAILABLE', 'The payment provider could not be reached. Please try again.');
   }
 
@@ -59,7 +68,7 @@ async function request(method, path, body, opts = {}) {
 
   const upstream = (data && typeof data.error === 'object' && data.error) || {};
   const code = upstream.code || 'SYNRAPAY_ERROR';
-  console.error(`[synrapay] ${method} ${path} -> ${res.status} ${code}: ${upstream.message || ''}`);
+  console.error(`[synrapay:${cfg.id}] ${method} ${path} -> ${res.status} ${code}: ${upstream.message || ''}`);
   if (PASS_THROUGH.has(code)) {
     throw new ApiError(res.status >= 500 ? 502 : res.status, code, upstream.message || 'Payment request was refused',
       Array.isArray(upstream.details)
@@ -67,39 +76,76 @@ async function request(method, path, body, opts = {}) {
         : upstream.field ? [{ path: upstream.field, message: upstream.message }] : undefined);
   }
   // Auth/signature problems are our configuration, not the shopper's fault: don't leak details.
-  throw new ApiError(502, 'PAYMENT_PROVIDER_ERROR', 'The payment could not be started. Please try again or choose another method.');
+  const err = new ApiError(502, 'PAYMENT_PROVIDER_ERROR', 'The payment could not be started. Please try again or choose another method.');
+  // For callers only (never sent to the client): what SynraPay actually answered.
+  err.providerCode = code;
+  err.providerStatus = res.status;
+  throw err;
 }
 
 const enc = encodeURIComponent;
 
-module.exports = {
-  payments: {
-    createOrder: (body) => request('POST', '/payments/create-order', body),
-    getStatus: (orderId) => request('POST', '/payments/getstatus', { orderId }),
-  },
-  hostedSessions: {
-    create: (body) => request('POST', '/payments/hosted/session', body),
-    get: (sessionId) => request('GET', `/payments/hosted/session/${enc(sessionId)}`),
-  },
-  /**
-   * Direct API: our server sends the card. Different product from Hosted Checkout (merchant_order_id,
-   * SynraPay order_id). pay/authenticate resolve for approved (200), 3-D Secure required (200,
-   * status REQUIRES_ACTION) and declined (402) alike - always branch on `status`.
-   */
-  direct: {
-    createOrder: (body) => request('POST', '/direct/create-order', body),
-    pay: (body) => request('POST', '/direct/payment', body, { acceptStatuses: [402], timeoutMs: 45000 }),
-    authenticate: (orderId) => request('POST', `/direct/payment/${enc(orderId)}/authenticate`, {}, { acceptStatuses: [402], timeoutMs: 45000 }),
-    status: (orderId) => request('GET', `/direct/payment/${enc(orderId)}/status`),
-    // No amount: takes everything the authorization holds.
-    capture: (orderId) => request('POST', `/direct/payment/${enc(orderId)}/capture`, {}, { timeoutMs: 45000 }),
-    void: (orderId, reason) => request('POST', `/direct/payment/${enc(orderId)}/void`, reason ? { reason } : {}, { timeoutMs: 45000 }),
-  },
-  paymentLinks: {
-    create: (body) => request('POST', '/payment-link/create', body),
-    createQuick: (body) => request('POST', '/payment-link/create-quick', body),
-    details: (body) => request('POST', '/payment-link/details', body),
-    remove: (body) => request('POST', '/payment-link/delete', body),
-    sendEmail: (body) => request('POST', '/payment-link/send-email', body),
-  },
-};
+/** The API of one environment. */
+function makeClient(cfg) {
+  return {
+    environment: cfg.id,
+    payments: {
+      createOrder: (body) => request(cfg, 'POST', '/payments/create-order', body),
+      getStatus: (lookup) => request(cfg, 'POST', '/payments/getstatus', typeof lookup === 'string' ? { orderId: lookup } : lookup),
+    },
+    hostedSessions: {
+      create: (body) => request(cfg, 'POST', '/payments/hosted/session', body),
+      get: (sessionId) => request(cfg, 'GET', `/payments/hosted/session/${enc(sessionId)}`),
+    },
+    /**
+     * Direct API: our server sends the card. Different product from Hosted Checkout (merchant_order_id,
+     * SynraPay order_id). pay/authenticate resolve for approved (200), 3-D Secure required (200,
+     * status REQUIRES_ACTION) and declined (402) alike - always branch on `status`.
+     */
+    direct: {
+      createOrder: (body) => request(cfg, 'POST', '/direct/create-order', body),
+      pay: (body) => request(cfg, 'POST', '/direct/payment', body, { acceptStatuses: [402], timeoutMs: 45000 }),
+      authenticate: (orderId) => request(cfg, 'POST', `/direct/payment/${enc(orderId)}/authenticate`, {}, { acceptStatuses: [402], timeoutMs: 45000 }),
+      status: (orderId) => request(cfg, 'GET', `/direct/payment/${enc(orderId)}/status`),
+      // No amount: takes everything the authorization holds.
+      capture: (orderId) => request(cfg, 'POST', `/direct/payment/${enc(orderId)}/capture`, {}, { timeoutMs: 45000 }),
+      void: (orderId, reason) => request(cfg, 'POST', `/direct/payment/${enc(orderId)}/void`, reason ? { reason } : {}, { timeoutMs: 45000 }),
+      // Sends captured money back. Every call is a new refund: after a timeout, read `status` before sending another.
+      refund: (orderId, body) => request(cfg, 'POST', `/direct/payment/${enc(orderId)}/refund`, body, { timeoutMs: 45000 }),
+    },
+    /**
+     * Tokenization: cards SynraPay keeps for a customer (customerId is our user id, the customer_id sent
+     * on Create Order). Responses carry brand / last4 / expiry only - never a card number or CVV.
+     */
+    savedCards: {
+      save: (customerId, body) => request(cfg, 'POST', `/direct/customers/${enc(customerId)}/payment-methods`, body, { timeoutMs: 45000 }),
+      list: (customerId) => request(cfg, 'GET', `/direct/customers/${enc(customerId)}/payment-methods`),
+      get: (customerId, id) => request(cfg, 'GET', `/direct/customers/${enc(customerId)}/payment-methods/${enc(id)}`),
+      remove: (customerId, id) => request(cfg, 'DELETE', `/direct/customers/${enc(customerId)}/payment-methods/${enc(id)}`),
+    },
+    paymentLinks: {
+      create: (body) => request(cfg, 'POST', '/payment-link/create', body),
+      createQuick: (body) => request(cfg, 'POST', '/payment-link/create-quick', body),
+      // { paymentLinkId } or { orderId } (our merchantOrderId); paymentLinkId wins if both are sent.
+      details: (body) => request(cfg, 'POST', '/payment-link/details', body),
+      // Filters and paging are all optional: {} is the most recent links of the last 30 days.
+      list: (body = {}) => request(cfg, 'POST', '/payment-link/list', body),
+      remove: (body) => request(cfg, 'POST', '/payment-link/delete', body),
+      sendEmail: (body) => request(cfg, 'POST', '/payment-link/send-email', body),
+    },
+  };
+}
+
+const clients = Object.fromEntries(Object.entries(config.synrapay.environments).map(([id, cfg]) => [id, makeClient(cfg)]));
+
+/**
+ * The client of one environment. Records made before there were two environments have none: they are `dev`.
+ * Throws PAYMENTS_UNAVAILABLE for an unknown or unconfigured environment.
+ */
+function env(id) {
+  const client = clients[id || 'dev'];
+  if (!client || !config.synrapay.environments[client.environment].enabled) throw unavailable();
+  return client;
+}
+
+module.exports = { env };

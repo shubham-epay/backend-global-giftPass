@@ -188,6 +188,7 @@ const checkout = asyncHandler(async (req, res) => {
   if (payments.SYNRAPAY_METHODS.includes(b.paymentMethod)) {
     try {
       payment = await payments.startPayment(result.order, b.paymentMethod, {
+        environment: b.paymentEnvironment,
         linkType: b.paymentLinkType, expiresInHours: b.paymentLinkExpiresInHours, captureMode: b.directCaptureMode, origin: req.get('origin'),
       });
     } catch (err) {

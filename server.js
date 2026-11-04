@@ -9,6 +9,9 @@ async function start() {
   await connectDB();
   server = app.listen(config.PORT, () => {
     console.log(`[api] Global Gift Pass admin API listening on :${config.PORT} (${config.NODE_ENV})`);
+    for (const e of Object.values(config.synrapay.environments).filter((x) => x.enabled)) {
+      console.log(`[api] SynraPay ${e.id} webhook: ${e.webhookUrl || `<public api host>${e.webhookPath}`} (register in the ${e.label} dashboard)`);
+    }
   });
   // Keeps payments/orders in step with SynraPay via Get Status, with or without webhooks.
   paymentReconciler.start();

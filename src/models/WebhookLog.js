@@ -19,6 +19,7 @@ const webhookLogSchema = new Schema({
 
   // Verification
   verified: { type: Boolean, required: true },                             // signature + API key accepted
+  environment: { type: String, maxlength: 20 },                            // SynraPay environment whose secret verified it (sandbox | dev)
   rejectReason: { type: String, maxlength: 120 },                          // why it was refused (verified: false)
   signatureTimestamp: { type: String, maxlength: 40 },                     // x-synrapay-timestamp as sent
   // When SynraPay signed the delivery. Deliveries can arrive out of order (an authorization after its

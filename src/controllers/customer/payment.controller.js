@@ -3,7 +3,6 @@ const asyncHandler = require('../../utils/asyncHandler');
 const ApiError = require('../../utils/ApiError');
 const { Payment } = require('../../models');
 const payments = require('../../services/payment.service');
-const synrapay = require('../../services/synrapay.service');
 const webhookLog = require('../../services/webhookLog.service');
 
 const tokenOf = (req) => req.get('x-payment-token') || undefined;
@@ -16,9 +15,15 @@ const paymentConfig = (_req, res) => {
     success: true,
     data: {
       enabled,
-      environment: config.synrapay.environment,
+      // The SynraPay environments the shopper can pay in (each a separate merchant account), default first.
+      environment: config.synrapay.defaultEnvironment,
+      environments: Object.values(config.synrapay.environments)
+        .filter((e) => e.enabled)
+        .sort((a, b) => (b.id === config.synrapay.defaultEnvironment) - (a.id === config.synrapay.defaultEnvironment))
+        .map((e) => ({ id: e.id, label: e.label })),
       methods: enabled ? payments.SYNRAPAY_METHODS : [],
       linkTypes: ['STANDARD', 'QUICK'],
+      savedCards: enabled && config.synrapay.tokenization,
       directCapture: { modes: ['AUTHORIZE', 'CAPTURE'], default: payments.DEFAULT_CAPTURE_MODE },
       linkExpiry: { defaultHours: config.PAYMENT_LINK_EXPIRES_HOURS, minHours: 24, maxHours: 720 },
     },
@@ -36,6 +41,7 @@ const paymentStatus = asyncHandler(async (req, res) => {
 const startPayment = asyncHandler(async (req, res) => {
   const order = await payments.findPayableOrder(req.params.orderNumber, { user: req.user, token: tokenOf(req) });
   const payment = await payments.startPayment(order, req.body.method, {
+    environment: req.body.environment,
     linkType: req.body.linkType, expiresInHours: req.body.expiresInHours, captureMode: req.body.captureMode, origin: req.get('origin'),
   });
   res.status(201).json({ success: true, data: { order: payments.orderPaymentView(order), payment } });
@@ -48,7 +54,7 @@ const sendLink = asyncHandler(async (req, res) => {
   if (!latest || latest.method !== 'PAY_BY_LINK' || latest.link?.status !== 'ACTIVE') {
     throw new ApiError(409, 'NO_ACTIVE_LINK', 'There is no active payment link for this order');
   }
-  const r = await synrapay.paymentLinks.sendEmail({
+  const r = await payments.api(latest).paymentLinks.sendEmail({
     paymentLinkId: latest.link.paymentLinkId, ...(req.body.email && { email: req.body.email }),
   });
   latest.events.push({ type: 'link.email_sent' });
@@ -57,15 +63,28 @@ const sendLink = asyncHandler(async (req, res) => {
 });
 
 /**
- * POST /api/payments/:orderNumber/direct/pay - Direct API: pay with card details from our own form.
+ * POST /api/payments/:orderNumber/direct/pay - Direct API: pay with card details from our own form,
+ * or with a saved card (paymentMethodId) when the signed-in customer owns the order.
  * The card goes straight to SynraPay; it is never stored or logged here. Possible results:
  *   PAID | REQUIRES_ACTION (3-D Secure: render data.action.html in an iframe) | DECLINED | CANCELLED | PENDING
  */
 const directPay = asyncHandler(async (req, res) => {
   const order = await payments.findPayableOrder(req.params.orderNumber, { user: req.user, token: tokenOf(req) });
-  const result = await payments.payDirect(order, req.body.card);
+  const result = await payments.payDirect(order, req.body, req.user, { origin: req.get('origin') });
   res.set('Cache-Control', 'no-store');
   res.json({ success: true, data: result });
+});
+
+/** GET /api/payments/:orderNumber/saved-cards - the signed-in owner's saved cards (brand, last 4, expiry) for this order. */
+const savedCards = asyncHandler(async (req, res) => {
+  const order = await payments.findPayableOrder(req.params.orderNumber, { user: req.user, token: tokenOf(req) });
+  res.json({ success: true, data: await payments.savedCardsFor(order, req.user) });
+});
+
+/** DELETE /api/payment-methods/:paymentMethodId?environment=sandbox|dev - revokes one of the signed-in customer's saved cards. */
+const removeSavedCard = asyncHandler(async (req, res) => {
+  await payments.removeSavedCard(req.user, req.params.paymentMethodId, req.query.environment);
+  res.json({ success: true, data: { id: req.params.paymentMethodId, removed: true } });
 });
 
 /** POST /api/payments/:orderNumber/direct/authenticate - finish the payment after the 3-D Secure challenge. */
@@ -91,7 +110,11 @@ const webhook = asyncHandler(async (req, res) => {
   setImmediate(async () => {
     try {
       const result = payments.resultFromWebhook(body, req.webhookEvent);
-      const r = await payments.applyResult(merchantOrderId, { ...result, eventId: req.webhookDeliveryId });
+      const r = await payments.applyResult(merchantOrderId, { ...result, eventId: req.webhookDeliveryId, environment: req.synrapayEnvironment });
+      if (r.payment?.method === 'HOSTED_SESSION') {
+        console.log(`[hosted-session] webhook ${req.webhookEvent || ''} payload:`, JSON.stringify(body, null, 2));
+        console.log('[hosted-session] webhook result:', JSON.stringify({ ignored: r.ignored, payment: r.payment.status, order: r.order?.orderStatus }));
+      }
       if (r.ignored) console.log(`[webhook] ${merchantOrderId} ${req.webhookEvent || body.status}: ${r.ignored}`);
       else console.log(`[webhook] ${merchantOrderId} -> payment ${r.payment.status}, order ${r.order?.orderStatus}`);
       // Keep the link's own status in step when SynraPay reports it.
@@ -110,4 +133,4 @@ const webhook = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { paymentConfig, paymentStatus, startPayment, sendLink, directPay, directAuthenticate, webhook };
+module.exports = { paymentConfig, paymentStatus, startPayment, sendLink, directPay, directAuthenticate, savedCards, removeSavedCard, webhook };
