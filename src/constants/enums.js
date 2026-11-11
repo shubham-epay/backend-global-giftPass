@@ -29,7 +29,7 @@ const PAYMENT_LINK_TYPES = ['STANDARD', 'QUICK'];
 // Direct API: AUTHORIZE holds the amount until an admin captures (or voids) it; CAPTURE takes it straight away.
 const DIRECT_CAPTURE_MODES = ['AUTHORIZE', 'CAPTURE'];
 // SynraPay environments (separate merchant accounts) a payment can be made in.
-const PAYMENT_ENVIRONMENTS = ['sandbox', 'dev'];
+const PAYMENT_ENVIRONMENTS = ['sandbox', 'dev', 'production'];
 const VOUCHER_STATUS = ['ACTIVE', 'REDEEMED', 'EXPIRED', 'EXCHANGED', 'CANCELLED'];
 const VOUCHER_TRANSITIONS = Object.freeze({
   ACTIVE: ['REDEEMED', 'EXPIRED', 'EXCHANGED', 'CANCELLED'],

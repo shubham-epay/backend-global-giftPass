@@ -21,7 +21,7 @@ const PROVIDER = 'SYNRAPAY';
 const DEFAULT_CAPTURE_MODE = config.synrapay.directManualCapture ? 'AUTHORIZE' : 'CAPTURE';
 const SYNRAPAY_METHODS = ['CARD', 'HOSTED_SESSION', 'PAY_BY_LINK', ...(config.synrapay.directEnabled ? ['DIRECT_CARD'] : [])];
 
-// ---------------- SynraPay environment (sandbox / dev) ----------------
+// ---------------- SynraPay environment (sandbox / dev / production) ----------------
 /** The environment an attempt belongs to. Attempts made before there were two environments are `dev`. */
 const envOf = (p) => p?.environment || 'dev';
 /** The SynraPay client for an attempt: always the environment it was created in. */
@@ -37,6 +37,9 @@ function environmentFor(requested) {
   }
   return id;
 }
+
+/** The methods an environment can be used for (dev: no Hosted Session; production: Hosted Checkout and Hosted Session). */
+const methodsIn = (id) => SYNRAPAY_METHODS.filter((m) => !config.synrapay.environments[id]?.methods || config.synrapay.environments[id].methods.includes(m));
 
 // ---------------- pay token (guest access to one order's payment) ----------------
 const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
@@ -298,7 +301,7 @@ const logSession = (label, value) => console.log(`[hosted-session] ${label}:`, J
 /**
  * Starts a SynraPay payment for a PENDING order.
  * @param {'CARD'|'HOSTED_SESSION'|'PAY_BY_LINK'} method
- * @param {{ environment?: 'sandbox'|'dev', linkType?: 'STANDARD'|'QUICK', expiresInHours?: number, captureMode?: 'AUTHORIZE'|'CAPTURE' }} opts
+ * @param {{ environment?: 'sandbox'|'dev'|'production', linkType?: 'STANDARD'|'QUICK', expiresInHours?: number, captureMode?: 'AUTHORIZE'|'CAPTURE' }} opts
  *   environment: the SynraPay environment (merchant account) to pay in; the configured default when omitted.
  * @returns the attempt view (HOSTED_SESSION includes the short-lived clientToken)
  */
@@ -306,6 +309,9 @@ async function startPayment(order, method, opts = {}) {
   if (!SYNRAPAY_METHODS.includes(method)) throw new ApiError(400, 'UNSUPPORTED_PAYMENT_METHOD', 'This payment method is not available');
   assertPayable(order);
   const environment = environmentFor(opts.environment);
+  if (!methodsIn(environment).includes(method)) {
+    throw new ApiError(400, 'UNSUPPORTED_PAYMENT_METHOD', `This payment method is not available in the ${config.synrapay.environments[environment].label} environment`);
+  }
   const client = synrapay.env(environment);
 
   await retirePreviousLinks(order);
@@ -1075,7 +1081,7 @@ async function latestPayment(order) {
 }
 
 module.exports = {
-  PROVIDER, DEFAULT_CAPTURE_MODE, SYNRAPAY_METHODS, ENVIRONMENTS, envOf, api, newPayToken, findPayableOrder, startPayment, applyResult, resultFromWebhook, merchantOrderIdOf,
+  PROVIDER, DEFAULT_CAPTURE_MODE, SYNRAPAY_METHODS, ENVIRONMENTS, methodsIn, envOf, api, newPayToken, findPayableOrder, startPayment, applyResult, resultFromWebhook, merchantOrderIdOf,
   reconcile, reconcilePayment, isOpen, latestPayment, retirePreviousLinks, paymentView, orderPaymentView, payDirect, completeDirect, settleAuthorization, refundPayment,
   savedCardsFor, removeSavedCard,
 };

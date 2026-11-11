@@ -20,7 +20,8 @@ const paymentConfig = (_req, res) => {
       environments: Object.values(config.synrapay.environments)
         .filter((e) => e.enabled)
         .sort((a, b) => (b.id === config.synrapay.defaultEnvironment) - (a.id === config.synrapay.defaultEnvironment))
-        .map((e) => ({ id: e.id, label: e.label })),
+        // methods: what the environment can be used for (dev: no Hosted Session; production: Hosted Checkout + Hosted Session).
+        .map((e) => ({ id: e.id, label: e.label, methods: payments.methodsIn(e.id) })),
       methods: enabled ? payments.SYNRAPAY_METHODS : [],
       linkTypes: ['STANDARD', 'QUICK'],
       savedCards: enabled && config.synrapay.tokenization,
@@ -81,7 +82,7 @@ const savedCards = asyncHandler(async (req, res) => {
   res.json({ success: true, data: await payments.savedCardsFor(order, req.user) });
 });
 
-/** DELETE /api/payment-methods/:paymentMethodId?environment=sandbox|dev - revokes one of the signed-in customer's saved cards. */
+/** DELETE /api/payment-methods/:paymentMethodId?environment=sandbox|dev|production - revokes one of the signed-in customer's saved cards. */
 const removeSavedCard = asyncHandler(async (req, res) => {
   await payments.removeSavedCard(req.user, req.params.paymentMethodId, req.query.environment);
   res.json({ success: true, data: { id: req.params.paymentMethodId, removed: true } });

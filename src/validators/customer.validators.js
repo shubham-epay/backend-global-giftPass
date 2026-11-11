@@ -123,7 +123,7 @@ const checkout = z.object({
   phone: z.string().trim().min(4, 'Enter a phone number').max(30),
   saveInfo: z.boolean().optional().default(false),
   paymentMethod: z.enum(E.PAYMENT_METHODS).default('CARD'),
-  paymentEnvironment: z.enum(E.PAYMENT_ENVIRONMENTS).optional(), // SynraPay sandbox | dev; the configured default when omitted
+  paymentEnvironment: z.enum(E.PAYMENT_ENVIRONMENTS).optional(), // SynraPay sandbox | dev | production; the configured default when omitted
   paymentLinkType: z.enum(E.PAYMENT_LINK_TYPES).optional(),
   directCaptureMode: z.enum(E.DIRECT_CAPTURE_MODES).optional(),
   paymentLinkExpiresInHours: z.number().int().min(24).max(720).optional(),

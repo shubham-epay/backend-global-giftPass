@@ -23,10 +23,15 @@ const envVars = (name) => ({
 // Older single webhook URL: accepts deliveries from either environment (whichever's secret verifies them).
 const SHARED_WEBHOOK_PATH = '/api/payments/synrapay/webhook';
 
-// Per environment: API base, label, and the Hosted Session SDK used when SynraPay doesn't name one.
+// Per environment: API base, label, and the Hosted Session script (from SynraPay's Hosted Session docs).
+// methods: the payment methods the environment may be used for (all when omitted). Hosted Session is
+// offered only where the docs give a hosted-session.js script: sandbox and production, not dev.
 const SYNRAPAY_ENVIRONMENTS = {
-  sandbox: { label: 'Sandbox', base: 'https://sandbox-api.synrapay.com/v1', sdk: 'https://sandbox.js.synrapay.com/direct/v1/sdk.js' },
-  dev: { label: 'Dev', base: 'https://dev-api.synrapay.com/v1', sdk: 'https://dev.js.synrapay.com/direct/v1/sdk.js' },
+  sandbox: { label: 'Sandbox', base: 'https://sandbox-api.synrapay.com/v1', sdk: 'https://sandbox.js.synrapay.com/hosted-session.js' },
+  dev: { label: 'Dev', base: 'https://dev-api.synrapay.com/v1', methods: ['CARD', 'PAY_BY_LINK', 'DIRECT_CARD'] },
+  // Live account: real cards are charged. Hosted Checkout (checkout.synrapay.com) and Hosted Session.
+  // Hosted Session needs the checkout origin (the live https site) registered with SynraPay.
+  production: { label: 'Production', base: 'https://api.synrapay.com/v1', sdk: 'https://js.synrapay.com/hosted-session.js', methods: ['CARD', 'HOSTED_SESSION'] },
 };
 
 const schema = z.object({
@@ -57,12 +62,13 @@ const schema = z.object({
   LOGIN_LOCK_MINUTES: z.coerce.number().int().positive().default(15),
 
   // ---------- SynraPay (payments) ----------
-  // Two SynraPay environments, each with its own merchant account: `sandbox` and `dev`. The storefront
-  // picks one per payment; an environment without a merchant ID and signing key is not offered.
+  // SynraPay environments, each with its own merchant account: `sandbox`, `dev` and `production`. The
+  // storefront picks one per payment; an environment without a merchant ID and signing key is not offered.
   // The unprefixed SYNRAPAY_* names are the older single-environment settings and still configure `dev`.
-  SYNRAPAY_DEFAULT_ENV: z.enum(['sandbox', 'dev']).default('dev'),
+  SYNRAPAY_DEFAULT_ENV: z.enum(['sandbox', 'dev', 'production']).default('dev'),
   ...envVars('SANDBOX'),
   ...envVars('DEV'),
+  ...envVars('PRODUCTION'),
   SYNRAPAY_BASE: optional,
   SYNRAPAY_MERCHANT_ID: optional,
   SYNRAPAY_SIGNATURE_KEY: optional,
@@ -109,6 +115,7 @@ function synrapayEnvironment(id) {
   return Object.freeze({
     id,
     label: defaults.label,
+    methods: defaults.methods, // undefined: every method
     enabled: Boolean(pick('MERCHANT_ID') && pick('SIGNATURE_KEY')),
     base,
     merchantId: pick('MERCHANT_ID'),
