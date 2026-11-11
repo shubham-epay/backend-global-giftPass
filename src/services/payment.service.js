@@ -134,6 +134,15 @@ const orderBody = (order, merchantOrderId, origin) => ({
   returnUrls: returnUrls(order, origin),
 });
 
+/** Direct API Create Order body. customer_id (our user id) lets a signed-in shopper save the card; guests have none. */
+const directOrderBody = (order, merchantOrderId) => ({
+  merchant_order_id: merchantOrderId,
+  amount: order.total.toFixed(2), // a string, so nothing reformats it between signing and sending
+  currency: order.currency,
+  ...(order.userId && { customer_id: String(order.userId) }),
+  customer: { name: order.customer?.name, email: order.customer?.email, phone: order.customer?.phone },
+});
+
 // ---------------- public views ----------------
 /** What the storefront needs about an attempt. Never includes card data or secrets beyond the client token. */
 function paymentView(p, { withClientToken } = {}) {
@@ -153,9 +162,8 @@ function paymentView(p, { withClientToken } = {}) {
       session: {
         sessionId: p.session?.sessionId,
         expiresAt: p.session?.expiresAt,
-        fallbackCheckoutUrl: p.session?.fallbackCheckoutUrl,
         ...(withClientToken && { clientToken: withClientToken }),
-        sdkUrl: p.session?.sdkUrl || config.synrapay.environments[envOf(p)].hostedSessionScript,
+        sdkUrl: config.synrapay.environments[envOf(p)].hostedSessionScript,
         environment: envOf(p),
       },
     }),
@@ -295,7 +303,7 @@ async function retirePreviousLinks(order) {
 
 /** Debug logging for the Hosted Session calls. The client token is a credential for the card form: only its start is shown. */
 const logSession = (label, value) => console.log(`[hosted-session] ${label}:`, JSON.stringify(
-  value?.clientToken ? { ...value, clientToken: `${String(value.clientToken).slice(0, 8)}...` } : value, null, 2,
+  value?.client_token ? { ...value, client_token: `${String(value.client_token).slice(0, 8)}...` } : value, null, 2,
 ));
 
 /**
@@ -324,45 +332,39 @@ async function startPayment(order, method, opts = {}) {
   let clientToken;
   const fields = {};
   if (method === 'HOSTED_SESSION') {
-    // The client token only works on the origin it was created for, and SynraPay needs `origin` sent
-    // once more than one is registered (e.g. the live site and http://localhost:5174).
+    // Hosted Session Client Token (Direct API), as in SynraPay's docs:
+    //   1. POST /direct/create-order   - the order, exactly as for a Direct card payment
+    //   2. POST /direct/hosted-session - { order_id, origin } -> client_token for the card fields
+    // The token works only on `origin`: the storefront page that shows the card fields.
     const origin = sessionOriginFor(opts.origin);
-    const { address, items } = await sessionDetails(order);
-    // Full Create Session body: the order, plus the optional customer address, line items and origin.
-    let session = {
-      ...body,
-      customer: { ...body.customer, ...(address && { address }) },
-      ...(items && { order: { items } }),
-      origin,
-    };
-    let detailed = Boolean(address || items);
-    for (;;) {
-      try {
-        logSession('POST /payments/hosted/session payload', session);
-        data = await client.hostedSessions.create(session); // eslint-disable-line no-await-in-loop
-        logSession('POST /payments/hosted/session response', data);
-        break;
-      } catch (err) {
-        logSession('POST /payments/hosted/session error response', { status: err.statusCode, code: err.code, providerCode: err.providerCode, message: err.message, details: err.details });
-        if (err.code === 'ORIGIN_NOT_REGISTERED' && session.origin) {
-          console.error(`[payments] ${merchantOrderId}: Hosted Session origin ${session.origin} is not registered with SynraPay`);
-          throw err;
-        } else if (err.code === 'VALIDATION_ERROR' && detailed) {
-          // The address and items are optional extras: never let one of them stop the payment.
-          console.warn(`[payments] ${merchantOrderId}: SynraPay refused the optional order details (${JSON.stringify(err.details || err.message)}) - creating the session without them`);
-          session = { ...body, origin: session.origin };
-          detailed = false;
-        } else throw err;
-      }
+    const directOrder = directOrderBody(order, merchantOrderId);
+    logSession('POST /direct/create-order payload', directOrder);
+    try {
+      data = await client.direct.createOrder(directOrder);
+    } catch (err) {
+      logSession('POST /direct/create-order error response', { status: err.statusCode, code: err.code, providerCode: err.providerCode, message: err.message, details: err.details });
+      throw err;
     }
-    clientToken = data.clientToken;
-    fields.session = {
-      sessionId: data.sessionId,
-      expiresAt: data.clientTokenExpiresAt || data.expiresAt,
-      fallbackCheckoutUrl: data.fallbackCheckoutUrl,
-      // SynraPay returns the SDK that matches the token (hf1. tokens need /direct/v1/sdk.js): use it as given.
-      sdkUrl: config.synrapay.environments[environment].hostedSessionScriptOverride || data.sdkUrl,
-    };
+    logSession('POST /direct/create-order response', data);
+
+    const tokenRequest = { order_id: data.order_id, origin };
+    let session;
+    logSession('POST /direct/hosted-session payload', tokenRequest);
+    try {
+      session = await client.direct.hostedSession(tokenRequest);
+    } catch (err) {
+      logSession('POST /direct/hosted-session error response', { status: err.statusCode, code: err.code, providerCode: err.providerCode, message: err.message, details: err.details });
+      if (err.providerCode === 'UNAUTHORIZED_MERCHANT') {
+        console.error(`[payments] ${merchantOrderId}: the Direct API is not enabled for this account in ${environment} - Hosted Session needs it`);
+      }
+      throw err;
+    }
+    logSession('POST /direct/hosted-session response', session);
+
+    clientToken = session.client_token; // passed unchanged to SynraHostedSession.mount()
+    fields.direct = { orderId: data.order_id, captureMode: 'CAPTURE' }; // capture defaults to true: a sale
+    fields.session = { sessionId: session.session_id, expiresAt: session.expires_at };
+    data.transactionId = data.order_id;
   } else if (method === 'PAY_BY_LINK') {
     const kind = opts.linkType === 'QUICK' ? 'QUICK' : 'STANDARD';
     const expiresInHours = opts.expiresInHours || config.PAYMENT_LINK_EXPIRES_HOURS;
@@ -376,13 +378,7 @@ async function startPayment(order, method, opts = {}) {
     fields.link = { kind, paymentLinkId: data.paymentLinkId, url: data.paymentLinkUrl || data.redirectUrl, status: 'ACTIVE', expiresAt: data.expiresAt };
   } else if (method === 'DIRECT_CARD') {
     // Direct API order: amount + our reference only, no card data yet. The card is sent later by payDirect.
-    data = await client.direct.createOrder({
-      merchant_order_id: merchantOrderId,
-      amount: order.total.toFixed(2), // a string, so nothing reformats it between signing and sending
-      currency: order.currency,
-      ...(order.userId && { customer_id: String(order.userId) }),
-      customer: { name: order.customer?.name, email: order.customer?.email, phone: order.customer?.phone },
-    });
+    data = await client.direct.createOrder(directOrderBody(order, merchantOrderId));
     fields.direct = { orderId: data.order_id, captureMode: opts.captureMode || DEFAULT_CAPTURE_MODE };
     data.transactionId = data.order_id;
   } else {
@@ -657,7 +653,8 @@ async function reconcilePayment(payment) {
   let providerStatus;
   try {
     let data;
-    if (payment.method === 'DIRECT_CARD') {
+    // Direct API orders: Direct card payments, and Hosted Sessions made with a client token.
+    if (payment.method === 'DIRECT_CARD' || (payment.method === 'HOSTED_SESSION' && payment.direct?.orderId)) {
       if (!payment.direct?.orderId) return { payment, changed: false };
       const st = await api(payment).direct.status(payment.direct.orderId);
       // A hold has nothing captured yet: compare what is held, not what was taken.
@@ -1018,7 +1015,7 @@ const cents = (v) => Math.round(Number(v || 0) * 100);
 async function refundPayment(paymentId, { amount, reason } = {}) {
   const payment = await Payment.findOne({ _id: paymentId, provider: PROVIDER });
   if (!payment) throw ApiError.notFound('Payment');
-  if (payment.method !== 'DIRECT_CARD' || !payment.direct?.orderId) {
+  if (!['DIRECT_CARD', 'HOSTED_SESSION'].includes(payment.method) || !payment.direct?.orderId) {
     throw new ApiError(409, 'REFUND_NOT_SUPPORTED', 'Only Direct API card payments can be refunded here. Refund this payment in the SynraPay dashboard instead.');
   }
   if (payment.status === 'AUTHORIZED') {

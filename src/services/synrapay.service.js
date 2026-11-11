@@ -17,7 +17,7 @@ const ApiError = require('../utils/ApiError');
 const PASS_THROUGH = new Set([
   'VALIDATION_ERROR', 'DUPLICATE_ORDER_ID', 'ORDER_REJECTED_BY_RISK', 'ORDER_ALREADY_PAID', 'ORDER_NOT_PAYABLE', 'PAYMENT_IN_PROGRESS',
   'PAYMENT_LINK_NOT_FOUND', 'PAYMENT_LINK_NOT_EDITABLE', 'ORIGIN_NOT_REGISTERED', 'PAYMENT_BLOCKED', 'EMAIL_NOT_SENT',
-  'PROVIDER_UNAVAILABLE', 'PROVIDER_UNSUPPORTED', 'SESSION_EXPIRED',
+  'PROVIDER_UNAVAILABLE', 'PROVIDER_UNSUPPORTED', 'SESSION_EXPIRED', 'RATE_LIMITED', 'SERVICE_UNDER_MAINTENANCE',
   // Direct API
   'INVALID_PAYMENT', 'UNSUPPORTED_CURRENCY', 'ORDER_NOT_FOUND', 'GATEWAY_TIMEOUT',
 ]);
@@ -25,6 +25,13 @@ const PASS_THROUGH = new Set([
 function sign(rawBody, key) {
   const ts = Date.now().toString();
   const sig = crypto.createHmac('sha512', key).update(`${ts}.${rawBody}`).digest('hex');
+  return { ts, sig };
+}
+
+/** Signature version 2 (Direct API → Authentication): HMAC_SHA512(`${ts}.${METHOD}.${path}.${rawBody}`), path incl. /v1. */
+function signV2(method, path, rawBody, key) {
+  const ts = Date.now().toString();
+  const sig = crypto.createHmac('sha512', key).update(`${ts}.${method}.${path}.${rawBody}`).digest('hex');
   return { ts, sig };
 }
 
@@ -39,11 +46,13 @@ const unavailable = () => new ApiError(503, 'PAYMENTS_UNAVAILABLE', 'Online paym
 async function request(cfg, method, path, body, opts = {}) {
   if (!cfg.enabled) throw unavailable();
   const rawBody = body === undefined ? '' : JSON.stringify(body);
-  const { ts, sig } = sign(rawBody, cfg.signatureKey);
-
-  let res;
   const requestUrl = `${opts.absolute ? cfg.apiOrigin : cfg.base}${path}`;
   const route = new URL(requestUrl);
+  const { ts, sig } = opts.signatureVersion === 2
+    ? signV2(method, route.pathname, rawBody, cfg.signatureKey)
+    : sign(rawBody, cfg.signatureKey);
+
+  let res;
   console.log(`[synrapay:${cfg.id}] ${method} ${route.origin}${route.pathname}`);
   try {
     res = await fetch(requestUrl, {
@@ -53,6 +62,7 @@ async function request(cfg, method, path, body, opts = {}) {
         'x-merchant-id': cfg.merchantId,
         'x-timestamp': ts,
         'x-signature': sig,
+        ...(opts.signatureVersion === 2 && { 'x-signature-version': '2' }),
       },
       body: rawBody || undefined,
       signal: AbortSignal.timeout(opts.timeoutMs || 20000),
@@ -93,10 +103,6 @@ function makeClient(cfg) {
       createOrder: (body) => request(cfg, 'POST', '/payments/create-order', body),
       getStatus: (lookup) => request(cfg, 'POST', '/payments/getstatus', typeof lookup === 'string' ? { orderId: lookup } : lookup),
     },
-    hostedSessions: {
-      create: (body) => request(cfg, 'POST', '/payments/hosted/session', body),
-      get: (sessionId) => request(cfg, 'GET', `/payments/hosted/session/${enc(sessionId)}`),
-    },
     /**
      * Direct API: our server sends the card. Different product from Hosted Checkout (merchant_order_id,
      * SynraPay order_id). pay/authenticate resolve for approved (200), 3-D Secure required (200,
@@ -104,6 +110,8 @@ function makeClient(cfg) {
      */
     direct: {
       createOrder: (body) => request(cfg, 'POST', '/direct/create-order', body),
+      // Hosted Session client token for a Direct API order: { order_id, origin } -> { client_token, session_id, expires_at, ... }.
+      hostedSession: (body) => request(cfg, 'POST', '/direct/hosted-session', body, { signatureVersion: 2 }),
       pay: (body) => request(cfg, 'POST', '/direct/payment', body, { acceptStatuses: [402], timeoutMs: 45000 }),
       authenticate: (orderId) => request(cfg, 'POST', `/direct/payment/${enc(orderId)}/authenticate`, {}, { acceptStatuses: [402], timeoutMs: 45000 }),
       status: (orderId) => request(cfg, 'GET', `/direct/payment/${enc(orderId)}/status`),
