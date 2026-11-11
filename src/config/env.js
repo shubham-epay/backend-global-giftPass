@@ -31,7 +31,7 @@ const SYNRAPAY_ENVIRONMENTS = {
   dev: { label: 'Dev', base: 'https://dev-api.synrapay.com/v1', methods: ['CARD', 'PAY_BY_LINK', 'DIRECT_CARD'] },
   // Live account: real cards are charged. Hosted Checkout (checkout.synrapay.com) and Hosted Session.
   // Hosted Session needs the checkout origin (the live https site) registered with SynraPay.
-  production: { label: 'Production', base: 'https://api.synrapay.com/v1', sdk: 'https://js.synrapay.com/hosted-session.js', methods: ['CARD', 'HOSTED_SESSION'] },
+  production: { label: 'Production', base: 'https://api.synrapay.com/v1', sdk: 'https://js.synrapay.com/hosted-session.js', methods: ['CARD', 'HOSTED_SESSION'], hostedSessionVia: 'direct' },
 };
 
 const schema = z.object({
@@ -116,6 +116,9 @@ function synrapayEnvironment(id) {
     id,
     label: defaults.label,
     methods: defaults.methods, // undefined: every method
+    // How a Hosted Session client token is made: 'direct' = POST /direct/hosted-session (Direct API),
+    // otherwise Create Session (POST /payments/hosted/session).
+    hostedSessionVia: defaults.hostedSessionVia || 'session',
     enabled: Boolean(pick('MERCHANT_ID') && pick('SIGNATURE_KEY')),
     base,
     merchantId: pick('MERCHANT_ID'),
