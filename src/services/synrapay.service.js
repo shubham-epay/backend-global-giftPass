@@ -78,7 +78,7 @@ async function request(cfg, method, path, body, opts = {}) {
 
   const upstream = (data && typeof data.error === 'object' && data.error) || {};
   const code = upstream.code || 'SYNRAPAY_ERROR';
-  console.error(`[synrapay:${cfg.id}] ${method} ${path} -> ${res.status} ${code}: ${upstream.message || ''}`);
+  console.error(`[synrapay:${cfg.id}] ${method} ${path} -> ${res.status} ${code}: ${upstream.message || ''}${upstream.request_id ? ` (request ${upstream.request_id})` : ''}`);
   if (PASS_THROUGH.has(code)) {
     throw new ApiError(res.status >= 500 ? 502 : res.status, code, upstream.message || 'Payment request was refused',
       Array.isArray(upstream.details)
@@ -86,7 +86,11 @@ async function request(cfg, method, path, body, opts = {}) {
         : upstream.field ? [{ path: upstream.field, message: upstream.message }] : undefined);
   }
   // Auth/signature problems are our configuration, not the shopper's fault: don't leak details.
-  const err = new ApiError(502, 'PAYMENT_PROVIDER_ERROR', 'The payment could not be started. Please try again or choose another method.');
+  // SynraPay's own code and request reference (no secrets) so the cause is visible and support can find the call.
+  const err = new ApiError(502, 'PAYMENT_PROVIDER_ERROR', 'The payment could not be started. Please try again or choose another method.', [{
+    path: `synrapay:${cfg.id} ${method} ${route.pathname}`,
+    message: `${res.status} ${code}: ${upstream.message || ''}${upstream.request_id ? ` (SynraPay request ${upstream.request_id})` : ''}`,
+  }]);
   // For callers only (never sent to the client): what SynraPay actually answered.
   err.providerCode = code;
   err.providerStatus = res.status;
@@ -109,7 +113,7 @@ function makeClient(cfg) {
      * status REQUIRES_ACTION) and declined (402) alike - always branch on `status`.
      */
     direct: {
-      createOrder: (body) => request(cfg, 'POST', '/direct/create-order', body),
+      createOrder: (body, { signatureVersion } = {}) => request(cfg, 'POST', '/direct/create-order', body, { signatureVersion }),
       // Hosted Session client token for a Direct API order: { order_id, origin } -> { client_token, session_id, expires_at, ... }.
       hostedSession: (body) => request(cfg, 'POST', '/direct/hosted-session', body, { signatureVersion: 2 }),
       pay: (body) => request(cfg, 'POST', '/direct/payment', body, { acceptStatuses: [402], timeoutMs: 45000 }),

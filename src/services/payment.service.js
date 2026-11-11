@@ -340,7 +340,7 @@ async function startPayment(order, method, opts = {}) {
     const directOrder = directOrderBody(order, merchantOrderId);
     logSession('POST /direct/create-order payload', directOrder);
     try {
-      data = await client.direct.createOrder(directOrder);
+      data = await client.direct.createOrder(directOrder, { signatureVersion: 2 }); // Direct API signing, as the doc's samples
     } catch (err) {
       logSession('POST /direct/create-order error response', { status: err.statusCode, code: err.code, providerCode: err.providerCode, message: err.message, details: err.details });
       throw err;
