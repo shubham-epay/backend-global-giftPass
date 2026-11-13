@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const config = require('../config/env');
 const ApiError = require('../utils/ApiError');
+const { currentRoute, forLog } = require('../utils/logSafe');
 
 /**
  * SynraPay merchant API client. Every call is signed server to server:
@@ -42,7 +43,8 @@ const unavailable = () => new ApiError(503, 'PAYMENTS_UNAVAILABLE', 'Online paym
  * Signed request. Resolves to the response body; throws ApiError (code SYNRAPAY_* or SynraPay's own).
  * opts.acceptStatuses: extra HTTP statuses whose body is a result, not an error (Direct API: 402 = declined).
  * opts.absolute: `path` already includes /v1 (3-D Secure complete_url), so it is joined to the API host.
- * Request bodies are never logged: Direct API payments carry the card number and CVV.
+ * Every call is logged: the API, what we send and what SynraPay answers. Card data (number, CVV, expiry)
+ * is never logged, and client tokens show only their first characters.
  */
 async function request(cfg, method, path, body, opts = {}) {
   if (!cfg.enabled) throw unavailable();
@@ -54,7 +56,9 @@ async function request(cfg, method, path, body, opts = {}) {
     : sign(rawBody, cfg.signatureKey);
 
   let res;
-  console.log(`[synrapay:${cfg.id}] ${method} ${route.origin}${route.pathname}`);
+  const via = currentRoute() || 'background job';
+  console.log(`[synrapay:${cfg.id}] [for ${via}] -> ${method} ${route.origin}${route.pathname}${opts.signatureVersion === 2 ? ' (signature v2)' : ''}`
+    + (body === undefined ? '' : `\n  request: ${forLog(body)}`));
   try {
     res = await fetch(requestUrl, {
       method,
@@ -74,6 +78,7 @@ async function request(cfg, method, path, body, opts = {}) {
   }
 
   const data = await res.json().catch(() => null);
+  console.log(`[synrapay:${cfg.id}] [for ${via}] <- ${res.status} ${method} ${route.pathname}\n  response: ${forLog(data)}`);
   if (res.ok) return data || {};
   if (opts.acceptStatuses?.includes(res.status) && data && typeof data.error !== 'object') return data;
 

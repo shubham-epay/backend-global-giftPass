@@ -34,6 +34,8 @@ const paymentSchema = new Schema({
     fallbackCheckoutUrl: { type: String, maxlength: 2048 },
     // The SDK SynraPay names in the Create Session response: a client token only works with its own SDK.
     sdkUrl: { type: String, maxlength: 2048 },
+    // The SynraPay API the client token came from, e.g. "POST https://api.synrapay.com/v1/direct/hosted-session".
+    tokenApi: { type: String, maxlength: 300 },
   },
   link: {
     kind: { type: String, enum: PAYMENT_LINK_TYPES },

@@ -62,13 +62,32 @@ async function findPayableOrder(orderNumber, { user, token }) {
 }
 
 // ---------------- SynraPay request bodies ----------------
+/**
+ * SynraPay accepts English text only (letters A-Z, digits, standard punctuation): one other character, such
+ * as the "·" in our item titles or an accent in a name, refuses the whole order with VALIDATION_ERROR.
+ * Accents are dropped (José -> Jose), 5★ becomes 5-star, separators become a hyphen, anything else non-ASCII is removed.
+ */
+const english = (value) => String(value ?? '')
+  .replace(/(\d)\s*[\u2605\u2606]/g, '$1-star')              // 5★ -> 5-star
+  .replace(/[\u2605\u2606]/g, '*')
+  .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')       // é -> e
+  .replace(/[\u00b7\u2022\u2013\u2014\u2212|]/g, '-')       // · • – — − | -> -
+  .replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"')
+  .replace(/[^\x20-\x7e]/g, '')                             // anything else non-ASCII
+  .replace(/\s+/g, ' ')
+  .trim();
+/** A person's name half for SynraPay: letters, spaces, apostrophes, hyphens and periods, starting with a letter. */
+const englishName = (value) => english(value).replace(/[^A-Za-z '.-]/g, '').replace(/^[^A-Za-z]+/, '').trim();
+
 /** Name in two halves (each 2-120 chars) and the phone split into dial code + national number. */
 function synraCustomer(order) {
   const [first = '', ...rest] = (order.customer?.name || '').trim().split(/\s+/);
   const last = rest.join(' ');
   const c = { email: order.customer.email };
-  if (first.length >= 2) c.firstName = first.slice(0, 120);
-  if (last.length >= 2) c.lastName = last.slice(0, 120);
+  const firstName = englishName(first);
+  const lastName = englishName(last);
+  if (firstName.length >= 2) c.firstName = firstName.slice(0, 120);
+  if (lastName.length >= 2) c.lastName = lastName.slice(0, 120);
   const phone = order.customer?.phone && parsePhoneNumberFromString(order.customer.phone);
   if (phone?.isValid()) {
     c.phoneCountryCode = `+${phone.countryCallingCode}`;
@@ -86,9 +105,12 @@ function synraAddress(a) {
   const out = {};
   const country = isoCountry(a.country);
   if (country) out.country = country;
-  if (a.city) out.city = a.city;
-  if (a.line1) out.street = [a.line1, a.line2].filter(Boolean).join(', ').slice(0, 200);
-  if (a.postalCode) out.postalCode = a.postalCode;
+  const city = english(a.city);
+  const street = english([a.line1, a.line2].filter(Boolean).join(', '));
+  const postalCode = english(a.postalCode);
+  if (city) out.city = city.slice(0, 100);
+  if (street) out.street = street.slice(0, 200);
+  if (postalCode) out.postalCode = postalCode;
   return Object.keys(out).length ? out : undefined;
 }
 
@@ -98,7 +120,7 @@ async function sessionDetails(order) {
   const shipping = synraAddress(order.shippingAddress);
   const items = (await OrderItem.find({ orderId: order._id }).limit(100).lean()).map((it) => ({
     merchantItemId: String(it.productId || it.giftBoxId || it._id),
-    name: String(it.titleSnapshot || 'Item').slice(0, 200),
+    name: (english(it.titleSnapshot) || 'Gift card').slice(0, 200), // e.g. "Apple AED · 50 AED" -> "Apple AED - 50 AED"
     count: it.quantity,
     price: it.unitPrice,
   })).filter((it) => Number.isInteger(it.count) && it.count >= 1 && it.price >= 0);
@@ -163,6 +185,7 @@ function paymentView(p, { withClientToken } = {}) {
         sessionId: p.session?.sessionId,
         expiresAt: p.session?.expiresAt,
         fallbackCheckoutUrl: p.session?.fallbackCheckoutUrl,
+        tokenApi: p.session?.tokenApi,
         ...(withClientToken && { clientToken: withClientToken }),
         sdkUrl: config.synrapay.environments[envOf(p)].hostedSessionScript,
         environment: envOf(p),
@@ -350,7 +373,7 @@ async function startPayment(order, method, opts = {}) {
     const orderId = data.order?.order_id;
     // A Direct API order: status, refunds and webhooks go through the Direct API (capture defaults to true: a sale).
     fields.direct = { orderId, captureMode: 'CAPTURE' };
-    fields.session = { sessionId: data.session_id, expiresAt: data.expires_at };
+    fields.session = { sessionId: data.session_id, expiresAt: data.expires_at, tokenApi: `POST ${config.synrapay.environments[environment].base}/direct/hosted-session` };
     data.transactionId = orderId;
   } else if (method === 'HOSTED_SESSION') {
     // Create Session (docs: Hosted Session): ONE signed call that creates the SynraPay order and returns
@@ -391,6 +414,7 @@ async function startPayment(order, method, opts = {}) {
       expiresAt: data.clientTokenExpiresAt || data.expiresAt,
       // The same order on SynraPay's hosted page, for when the card fields cannot load (SDK_LOAD_FAILED / MOUNT_FAILED).
       fallbackCheckoutUrl: data.fallbackCheckoutUrl,
+      tokenApi: `POST ${config.synrapay.environments[environment].base}/payments/hosted/session`,
     };
   } else if (method === 'PAY_BY_LINK') {
     const kind = opts.linkType === 'QUICK' ? 'QUICK' : 'STANDARD';
@@ -415,7 +439,14 @@ async function startPayment(order, method, opts = {}) {
       customer: { ...body.customer, ...(address && { address }) },
       ...(items && { order: { items } }),
     };
-    data = await client.payments.createOrder(checkoutOrder);
+    try {
+      data = await client.payments.createOrder(checkoutOrder);
+    } catch (err) {
+      // The address and items are optional extras: never let one of them stop the payment.
+      if (err.code !== 'VALIDATION_ERROR' || !(address || items)) throw err;
+      console.warn(`[payments] ${merchantOrderId}: SynraPay refused the optional order details (${JSON.stringify(err.details || err.message)}) - creating the order without them`);
+      data = await client.payments.createOrder(body);
+    }
     fields.checkoutUrl = data.checkoutUrl || data.redirectUrl;
   }
 

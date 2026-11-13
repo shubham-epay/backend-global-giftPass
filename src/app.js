@@ -9,6 +9,7 @@ const morgan = require('morgan');
 
 const config = require('./config/env');
 const requestId = require('./middlewares/requestId');
+const apiLog = require('./middlewares/apiLog');
 const { apiLimiter } = require('./middlewares/rateLimiters');
 const { notFound, errorHandler } = require('./middlewares/errorHandler');
 const ApiError = require('./utils/ApiError');
@@ -57,6 +58,9 @@ morgan.token('id', (req) => req.id);
 app.use(morgan(config.isProd
   ? ':remote-addr :id :method :url :status :res[content-length] - :response-time ms'
   : 'dev', { skip: (req) => req.path === '/api/health' }));
+
+// Every API call: route, request body (writes), response, and the route each SynraPay call is made for.
+app.use(apiLog);
 
 // Admin responses must never be cached by browsers or proxies.
 app.use('/api/admin', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
