@@ -25,10 +25,10 @@ const SHARED_WEBHOOK_PATH = '/api/payments/synrapay/webhook';
 
 // Per environment: API base, label, and the Hosted Session script (from SynraPay's Hosted Session docs).
 // methods: the payment methods the environment may be used for (all when omitted). Hosted Session is
-// offered only where the docs give a hosted-session.js script: sandbox and production, not dev.
+// offered where SynraPay serves a hosted-session.js script: sandbox, dev (dev.js) and production.
 const SYNRAPAY_ENVIRONMENTS = {
   sandbox: { label: 'Sandbox', base: 'https://sandbox-api.synrapay.com/v1', sdk: 'https://sandbox.js.synrapay.com/hosted-session.js' },
-  dev: { label: 'Dev', base: 'https://dev-api.synrapay.com/v1', methods: ['CARD', 'PAY_BY_LINK', 'DIRECT_CARD'] },
+  dev: { label: 'Dev', base: 'https://dev-api.synrapay.com/v1', sdk: 'https://dev.js.synrapay.com/hosted-session.js', methods: ['CARD', 'HOSTED_SESSION', 'PAY_BY_LINK', 'DIRECT_CARD'] },
   // Live account: real cards are charged. Hosted Checkout (checkout.synrapay.com) and Hosted Session.
   // Hosted Session needs the checkout origin (the live https site) registered with SynraPay.
   production: { label: 'Production', base: 'https://api.synrapay.com/v1', sdk: 'https://js.synrapay.com/hosted-session.js', methods: ['CARD', 'HOSTED_SESSION'], hostedSessionVia: 'direct' },
